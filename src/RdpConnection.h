@@ -18,6 +18,7 @@ namespace KRdp
 {
 
 class InputHandler;
+class InBandGreeter;
 class Server;
 class VideoStream;
 class VideoStreamSurface;
@@ -63,11 +64,24 @@ public:
     };
 
     /**
+     * Authentication state of this RDP connection.
+     *
+     * Desktop screencasting, KWin EIS input, and Clipboard MUST NOT be attached
+     * until authState() == AuthState::Authenticated.
+     */
+    enum class AuthState {
+        Unauthenticated,
+        PendingInBandGreeter,
+        Authenticated,
+    };
+
+    /**
      * Transport metadata for an accepted connection.
      */
     struct TransportInfo {
         Server::Transport transport = Server::Transport::Tcp;
         bool vmConnectMode = false;
+        bool inBandGreeterEnabled = false;
         quint32 vsockPeerCid = 0;
         quint32 vsockPeerPort = 0;
     };
@@ -93,6 +107,25 @@ public:
      */
     State state() const;
     Q_SIGNAL void stateChanged(State newState);
+
+    /**
+     * The current authentication state.
+     */
+    AuthState authState() const;
+    bool isAuthenticated() const;
+    Q_SIGNAL void authStateChanged(AuthState newAuthState);
+    Q_SIGNAL void authenticatedChanged(bool authenticated);
+
+    /**
+     * Validate guest username/password against PAM and/or configured non-root KRdp users.
+     */
+    bool verifyGuestCredentials(const QString &username, const QString &password) const;
+
+    /**
+     * The isolated in-band greeter used when a Hyper-V VMConnect peer connects without
+     * a password in TS_INFO_PACKET.
+     */
+    InBandGreeter *inBandGreeter() const;
 
     /**
      * Close the connection
@@ -135,6 +168,8 @@ private:
     friend class DisplayControl;
 
     void setState(State newState);
+    void setAuthState(AuthState newAuthState);
+    void startInBandGreeter();
     void initialize();
     void run(std::stop_token stopToken);
 

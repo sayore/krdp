@@ -55,7 +55,10 @@ public:
         connect(connection->clipboard(), &KRdp::Clipboard::clientDataChanged, session.get(), [clipboard = connection->clipboard(), this]() {
             session->setClipboardData(clipboard->getClipboard());
         });
-        connect(connection->displayControl(), &KRdp::DisplayControl::requestedScreenSizeChanged, connection->videoStream(), &KRdp::VideoStream::setRequestedSize);
+        connect(connection->displayControl(),
+                &KRdp::DisplayControl::requestedScreenSizeChanged,
+                connection->videoStream(),
+                &KRdp::VideoStream::setRequestedSize);
 
         connect(connection, &QObject::destroyed, this, &SessionWrapper::onConnectionDestroyed);
     }
@@ -197,14 +200,23 @@ void SessionController::setSessionLocked(bool locked)
 
 void SessionController::onNewConnection(KRdp::RdpConnection *newConnection)
 {
-    connect(newConnection, &KRdp::RdpConnection::stateChanged, this, [this, newConnection](KRdp::RdpConnection::State state) {
-        // RDP authentication has completed by the time the connection is activated.
-        // Do not request a screencast session for clients that fail authentication.
-        if (state != KRdp::RdpConnection::State::Activated) {
+    auto attached = std::make_shared<bool>(false);
+    QPointer<KRdp::RdpConnection> safeConnection(newConnection);
+
+    auto maybeAttachDesktopSession = [this, safeConnection, attached]() {
+        if (*attached || !safeConnection) {
             return;
         }
+        // Strict security boundary: NEVER create a PipeWire screencast, KWin EIS input
+        // connection, or Clipboard bridge until guest authentication has succeeded
+        // (either in onPostConnect() or via the isolated InBandGreeter).
+        const auto st = safeConnection->state();
+        if ((st != KRdp::RdpConnection::State::Activated && st != KRdp::RdpConnection::State::Streaming) || !safeConnection->isAuthenticated()) {
+            return;
+        }
+        *attached = true;
 
-        auto wrapper = std::make_unique<SessionWrapper>(newConnection, makeSession(), m_sni);
+        auto wrapper = std::make_unique<SessionWrapper>(safeConnection.data(), makeSession(), m_sni);
         if (m_virtualMonitor) {
             wrapper->session->setVirtualMonitor(*m_virtualMonitor);
         } else if (m_monitorIndex) {
@@ -246,12 +258,25 @@ void SessionController::onNewConnection(KRdp::RdpConnection *newConnection)
             }
         });
 
-        connect(wrapper.get(), &SessionWrapper::sessionError, this, [newConnection] {
-            newConnection->close(KRdp::RdpConnection::CloseReason::None);
+        connect(wrapper.get(), &SessionWrapper::sessionError, this, [safeConnection] {
+            if (safeConnection) {
+                safeConnection->close(KRdp::RdpConnection::CloseReason::None);
+            }
         });
 
         wrapper->session->start();
         m_wrappers.push_back(std::move(wrapper));
+    };
+
+    connect(newConnection, &KRdp::RdpConnection::stateChanged, this, [maybeAttachDesktopSession](KRdp::RdpConnection::State state) {
+        if (state == KRdp::RdpConnection::State::Activated || state == KRdp::RdpConnection::State::Streaming) {
+            maybeAttachDesktopSession();
+        }
+    });
+    connect(newConnection, &KRdp::RdpConnection::authenticatedChanged, this, [maybeAttachDesktopSession](bool authenticated) {
+        if (authenticated) {
+            maybeAttachDesktopSession();
+        }
     });
 }
 

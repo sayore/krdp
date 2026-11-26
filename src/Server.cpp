@@ -46,6 +46,7 @@ public:
 
     Transport transport = Transport::Tcp;
     bool hyperVMode = false;
+    bool inBandGreeterEnabled = false;
     quint32 vsockBindCid = DefaultVsockBindCid;
     quint32 allowedVsockPeerCid = DefaultVsockPeerCid;
     int vsockFd = -1;
@@ -85,6 +86,10 @@ bool Server::start()
     if (d->transport == Transport::Tcp) {
         if (d->hyperVMode) {
             qCCritical(KRDP) << "Hyper-V VMConnect mode is strictly restricted to AF_VSOCK transport and cannot be enabled on TCP";
+            return false;
+        }
+        if (d->inBandGreeterEnabled) {
+            qCCritical(KRDP) << "In-band greeter mode is strictly restricted to AF_VSOCK Hyper-V VMConnect transport and cannot be enabled on TCP";
             return false;
         }
 
@@ -168,6 +173,7 @@ bool Server::start()
                 RdpConnection::TransportInfo info;
                 info.transport = Transport::Vsock;
                 info.vmConnectMode = d->hyperVMode;
+                info.inBandGreeterEnabled = d->hyperVMode && d->inBandGreeterEnabled;
                 info.vsockPeerCid = peerAddr.svm_cid;
                 info.vsockPeerPort = peerAddr.svm_port;
 
@@ -253,6 +259,16 @@ bool Server::hyperVMode() const
 void Server::setHyperVMode(bool enabled)
 {
     d->hyperVMode = enabled;
+}
+
+bool Server::inBandGreeterEnabled() const
+{
+    return d->inBandGreeterEnabled;
+}
+
+void Server::setInBandGreeterEnabled(bool enabled)
+{
+    d->inBandGreeterEnabled = enabled;
 }
 
 quint32 Server::vsockBindCid() const

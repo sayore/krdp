@@ -79,6 +79,16 @@ public:
     void setHyperVMode(bool enabled);
 
     /**
+     * Whether the isolated in-band login greeter is enabled for Hyper-V VMConnect
+     * connections that do not send a password in TS_INFO_PACKET (e.g. vmconnect.exe).
+     *
+     * Strictly restricted to Transport::Vsock with hyperVMode() == true.
+     * Enabling it on Transport::Tcp causes start() to fail.
+     */
+    bool inBandGreeterEnabled() const;
+    void setInBandGreeterEnabled(bool enabled);
+
+    /**
      * The AF_VSOCK CID to bind to when transport() == Transport::Vsock.
      *
      * Defaults to VMADDR_CID_ANY (0xFFFFFFFFU).
@@ -129,7 +139,6 @@ public:
     QList<User> users() const;
     void setUsers(const QList<User> &users);
     void addUser(const User &user);
-
 
     /** Whether to authenticate against PAM for the user running the daemon
      */

@@ -1,21 +1,8 @@
-diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 85a8c7a..bed441a 100644
---- a/CMakeLists.txt
-+++ b/CMakeLists.txt
-@@ -12,6 +12,8 @@ set(KDE_COMPILERSETTINGS_LEVEL "5.85")
- project(KRdp VERSION "${PROJECT_VERSION}")
- 
- include(FeatureSummary)
-+include(CheckIncludeFile)
-+check_include_file("linux/vm_sockets.h" HAVE_LINUX_VM_SOCKETS_H)
- find_package(ECM ${KF6_MIN_VERSION} NO_MODULE)
- set_package_properties(ECM PROPERTIES TYPE REQUIRED DESCRIPTION "Extra CMake Modules." URL "https://commits.kde.org/extra-cmake-modules")
- feature_summary(WHAT REQUIRED_PACKAGES_NOT_FOUND FATAL_ON_MISSING_REQUIRED_PACKAGES)
 diff --git a/autotests/CMakeLists.txt b/autotests/CMakeLists.txt
-index 2bba0e5..a82bef3 100644
+index 2bba0e5..858c723 100644
 --- a/autotests/CMakeLists.txt
 +++ b/autotests/CMakeLists.txt
-@@ -1,7 +1,14 @@
+@@ -1,7 +1,25 @@
  # SPDX-FileCopyrightText: 2026 Nicolas Fella <nicolas.fella@gmx.de>
  # SPDX-License-Identifier: BSD-2-Clause
  
@@ -30,12 +17,23 @@ index 2bba0e5..a82bef3 100644
 +    TEST_NAME vsocktransporttest
 +    LINK_LIBRARIES KRdp Qt6::Test Qt6::Network
 +)
++
++ecm_add_test(vmconnectauthtest.cpp
++    ../src/RdpConnection.cpp
++    ../src/PeerContext.cpp
++    ../src/NetworkDetection.cpp
++    ${CMAKE_BINARY_DIR}/src/krdp_logging.cpp
++    TEST_NAME vmconnectauthtest
++    LINK_LIBRARIES KRdp Qt6::Test Qt6::Network Qt6::Gui
++)
++target_include_directories(vmconnectauthtest PRIVATE ${CMAKE_BINARY_DIR}/src ${CMAKE_SOURCE_DIR}/src)
++target_compile_definitions(vmconnectauthtest PRIVATE KRDP_VMCONNECT_TEST_HARNESS KRDP_STATIC_DEFINE)
 diff --git a/autotests/vsocktransporttest.cpp b/autotests/vsocktransporttest.cpp
 new file mode 100644
-index 0000000..2ae7dd4
+index 0000000..2fcdfff
 --- /dev/null
 +++ b/autotests/vsocktransporttest.cpp
-@@ -0,0 +1,285 @@
+@@ -0,0 +1,300 @@
 +// SPDX-FileCopyrightText: 2026 FOXCORE Integration
 +// SPDX-License-Identifier: LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL
 +
@@ -103,6 +101,21 @@ index 0000000..2ae7dd4
 +        KRdp::Server server;
 +        server.setTransport(KRdp::Server::Transport::Tcp);
 +        server.setHyperVMode(true);
++        server.setAddress(QHostAddress::LocalHost);
++        server.setPort(0);
++        server.setTlsCertificate(m_certPath);
++        server.setTlsCertificateKey(m_keyPath);
++
++        QVERIFY(!server.start());
++        QVERIFY(!server.isListeningTransport());
++    }
++
++    void testTcpRejectsInBandGreeter()
++    {
++        KRdp::Server server;
++        server.setTransport(KRdp::Server::Transport::Tcp);
++        server.setHyperVMode(false);
++        server.setInBandGreeterEnabled(true);
 +        server.setAddress(QHostAddress::LocalHost);
 +        server.setPort(0);
 +        server.setTlsCertificate(m_certPath);
@@ -321,8 +334,81 @@ index 0000000..2ae7dd4
 +
 +QTEST_MAIN(VsockTransportTest)
 +#include "vsocktransporttest.moc"
+diff --git a/server/SessionController.cpp b/server/SessionController.cpp
+index ea7f331..8dbb57d 100644
+--- a/server/SessionController.cpp
++++ b/server/SessionController.cpp
+@@ -55,7 +55,10 @@ public:
+         connect(connection->clipboard(), &KRdp::Clipboard::clientDataChanged, session.get(), [clipboard = connection->clipboard(), this]() {
+             session->setClipboardData(clipboard->getClipboard());
+         });
+-        connect(connection->displayControl(), &KRdp::DisplayControl::requestedScreenSizeChanged, connection->videoStream(), &KRdp::VideoStream::setRequestedSize);
++        connect(connection->displayControl(),
++                &KRdp::DisplayControl::requestedScreenSizeChanged,
++                connection->videoStream(),
++                &KRdp::VideoStream::setRequestedSize);
+ 
+         connect(connection, &QObject::destroyed, this, &SessionWrapper::onConnectionDestroyed);
+     }
+@@ -197,14 +200,23 @@ void SessionController::setSessionLocked(bool locked)
+ 
+ void SessionController::onNewConnection(KRdp::RdpConnection *newConnection)
+ {
+-    connect(newConnection, &KRdp::RdpConnection::stateChanged, this, [this, newConnection](KRdp::RdpConnection::State state) {
+-        // RDP authentication has completed by the time the connection is activated.
+-        // Do not request a screencast session for clients that fail authentication.
+-        if (state != KRdp::RdpConnection::State::Activated) {
++    auto attached = std::make_shared<bool>(false);
++    QPointer<KRdp::RdpConnection> safeConnection(newConnection);
++
++    auto maybeAttachDesktopSession = [this, safeConnection, attached]() {
++        if (*attached || !safeConnection) {
++            return;
++        }
++        // Strict security boundary: NEVER create a PipeWire screencast, KWin EIS input
++        // connection, or Clipboard bridge until guest authentication has succeeded
++        // (either in onPostConnect() or via the isolated InBandGreeter).
++        const auto st = safeConnection->state();
++        if ((st != KRdp::RdpConnection::State::Activated && st != KRdp::RdpConnection::State::Streaming) || !safeConnection->isAuthenticated()) {
+             return;
+         }
++        *attached = true;
+ 
+-        auto wrapper = std::make_unique<SessionWrapper>(newConnection, makeSession(), m_sni);
++        auto wrapper = std::make_unique<SessionWrapper>(safeConnection.data(), makeSession(), m_sni);
+         if (m_virtualMonitor) {
+             wrapper->session->setVirtualMonitor(*m_virtualMonitor);
+         } else if (m_monitorIndex) {
+@@ -246,12 +258,25 @@ void SessionController::onNewConnection(KRdp::RdpConnection *newConnection)
+             }
+         });
+ 
+-        connect(wrapper.get(), &SessionWrapper::sessionError, this, [newConnection] {
+-            newConnection->close(KRdp::RdpConnection::CloseReason::None);
++        connect(wrapper.get(), &SessionWrapper::sessionError, this, [safeConnection] {
++            if (safeConnection) {
++                safeConnection->close(KRdp::RdpConnection::CloseReason::None);
++            }
+         });
+ 
+         wrapper->session->start();
+         m_wrappers.push_back(std::move(wrapper));
++    };
++
++    connect(newConnection, &KRdp::RdpConnection::stateChanged, this, [maybeAttachDesktopSession](KRdp::RdpConnection::State state) {
++        if (state == KRdp::RdpConnection::State::Activated || state == KRdp::RdpConnection::State::Streaming) {
++            maybeAttachDesktopSession();
++        }
++    });
++    connect(newConnection, &KRdp::RdpConnection::authenticatedChanged, this, [maybeAttachDesktopSession](bool authenticated) {
++        if (authenticated) {
++            maybeAttachDesktopSession();
++        }
+     });
+ }
+ 
 diff --git a/server/main.cpp b/server/main.cpp
-index c5a2a91..e291f55 100644
+index c5a2a91..e3a4635 100644
 --- a/server/main.cpp
 +++ b/server/main.cpp
 @@ -23,6 +23,17 @@
@@ -343,20 +429,23 @@ index c5a2a91..e291f55 100644
  static std::optional<SessionController::OperationMode> parseOperationMode(QAnyStringView value)
  {
      if (value == u"RemoteAccess"_s) {
-@@ -58,6 +69,12 @@ int main(int argc, char **argv)
+@@ -58,6 +69,15 @@ int main(int argc, char **argv)
          {{u"p"_s, u"password"_s}, u"The password to use for login. Requires username to be passed as well."_s, u"password"_s},
          {u"address"_s, u"The address to listen on for connections. Defaults to 0.0.0.0"_s, u"address"_s},
          {u"port"_s, u"The port to use for connections. Defaults to 3389."_s, u"port"_s, u"3389"_s},
 +        {u"transport"_s, u"The transport to listen on: tcp (default) or vsock (Hyper-V Enhanced Session AF_VSOCK)."_s, u"transport"_s, u"tcp"_s},
 +        {u"vmconnect"_s, u"Enable Hyper-V VMConnect mode (only valid with --transport vsock; enabled by default for vsock)."_s},
 +        {u"no-vmconnect"_s, u"Disable Hyper-V VMConnect mode on --transport vsock and require full TLS/NLA."_s},
++        {u"in-band-greeter"_s,
++         u"Enable isolated in-band login greeter for Hyper-V VMConnect clients that omit a password in TS_INFO_PACKET (default: on for vsock vmconnect)."_s},
++        {u"no-in-band-greeter"_s, u"Disable the in-band login greeter and reject connections that omit a password in TS_INFO_PACKET."_s},
 +        {u"vsock-cid"_s, u"The AF_VSOCK CID to bind to when using --transport vsock (numeric CID or 'any', default: any)."_s, u"cid"_s, u"any"_s},
 +        {u"vsock-peer-cid"_s, u"The only AF_VSOCK peer CID permitted to connect (default: 2 / VMADDR_CID_HOST)."_s, u"cid"_s, u"2"_s},
 +        {u"pam"_s, u"Enable PAM authentication for the current non-root user."_s},
          {u"certificate"_s, u"The TLS certificate file to use."_s, u"certificate"_s, u"server.crt"_s},
          {u"certificate-key"_s, u"The TLS certificate key to use."_s, u"certificate-key"_s, u"server.key"_s},
          {u"monitor"_s, u"The index of the monitor to use when streaming."_s, u"monitor"_s, u"-1"_s},
-@@ -97,6 +114,23 @@ int main(int argc, char **argv)
+@@ -97,6 +117,34 @@ int main(int argc, char **argv)
          }
      };
  
@@ -371,21 +460,33 @@ index c5a2a91..e291f55 100644
 +        return 1;
 +    }
 +
++    if (parser.isSet(u"in-band-greeter"_s) && parser.isSet(u"no-in-band-greeter"_s)) {
++        qWarning() << "--in-band-greeter and --no-in-band-greeter cannot be combined";
++        return 1;
++    }
++
 +    const bool hyperVMode = (*transport == KRdp::Server::Transport::Vsock) ? !parser.isSet(u"no-vmconnect"_s) : parser.isSet(u"vmconnect"_s);
 +    if (hyperVMode && *transport != KRdp::Server::Transport::Vsock) {
 +        qWarning() << "--vmconnect is strictly restricted to --transport vsock and cannot be used with TCP";
 +        return 1;
 +    }
 +
++    const bool inBandGreeter = hyperVMode ? !parser.isSet(u"no-in-band-greeter"_s) : parser.isSet(u"in-band-greeter"_s);
++    if (inBandGreeter && !hyperVMode) {
++        qWarning() << "--in-band-greeter is strictly restricted to --transport vsock with --vmconnect";
++        return 1;
++    }
++
      QHostAddress address = QHostAddress::Any;
      if (parser.isSet(u"address"_s)) {
          address = QHostAddress(parser.value(u"address"_s));
-@@ -107,6 +141,30 @@ int main(int argc, char **argv)
+@@ -107,6 +155,31 @@ int main(int argc, char **argv)
  
      KRdp::Server server(nullptr);
  
 +    server.setTransport(*transport);
 +    server.setHyperVMode(hyperVMode);
++    server.setInBandGreeterEnabled(inBandGreeter);
 +    if (*transport == KRdp::Server::Transport::Vsock) {
 +        const QString bindCidStr = parser.value(u"vsock-cid"_s).trimmed().toLower();
 +        if (bindCidStr != u"any"_s) {
@@ -411,7 +512,7 @@ index c5a2a91..e291f55 100644
      server.setAddress(address);
      server.setPort(port);
  
-@@ -119,10 +177,13 @@ int main(int argc, char **argv)
+@@ -119,10 +192,13 @@ int main(int argc, char **argv)
          user.name = parser.value(u"username"_s);
          user.password = parser.value(u"password"_s);
          server.addUser(user);
@@ -427,10 +528,19 @@ index c5a2a91..e291f55 100644
          const auto users = config->users();
          for (const auto &userName : users) {
 diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
-index d50ac72..9a23c03 100644
+index d50ac72..43c4bd8 100644
 --- a/src/CMakeLists.txt
 +++ b/src/CMakeLists.txt
-@@ -62,6 +62,10 @@ target_sources(KRdp PRIVATE ${_dbus_sources})
+@@ -22,6 +22,8 @@ target_sources(KRdp PRIVATE
+     DisplayControl.h
+     EiConnection.cpp
+     EiConnection.h
++    InBandGreeter.cpp
++    InBandGreeter.h
+     RdpConnection.cpp
+     Server.cpp
+     Server.h
+@@ -62,6 +64,10 @@ target_sources(KRdp PRIVATE ${_dbus_sources})
  
  target_include_directories(KRdp PUBLIC ${FreeRDP_INCLUDE_DIR} ${WinPR_INCLUDE_DIR} ${FreeRDP_Server_INCLUDE_DIR})
  
@@ -442,13 +552,14 @@ index d50ac72..9a23c03 100644
      Qt::Core
      Qt::Gui
 diff --git a/src/RdpConnection.cpp b/src/RdpConnection.cpp
-index 723b513..c516eb9 100644
+index 723b513..bcce7aa 100644
 --- a/src/RdpConnection.cpp
 +++ b/src/RdpConnection.cpp
-@@ -9,10 +9,19 @@
+@@ -9,10 +9,20 @@
  
  #include "RdpConnection.h"
  
++#include <atomic>
 +#include <cerrno>
 +#include <cstdio>
 +#include <cstring>
@@ -465,7 +576,15 @@ index 723b513..c516eb9 100644
  
  #include <QHostAddress>
  #include <QStandardPaths>
-@@ -67,6 +76,10 @@ static bool createSamFile(QTemporaryFile &file, const QList<User> &users)
+@@ -30,6 +40,7 @@
+ #include "Clipboard.h"
+ #include "Cursor.h"
+ #include "DisplayControl.h"
++#include "InBandGreeter.h"
+ #include "InputHandler.h"
+ #include "NetworkDetection.h"
+ #include "PeerContext_p.h"
+@@ -67,6 +78,10 @@ static bool createSamFile(QTemporaryFile &file, const QList<User> &users)
  
      for (const auto &user : users) {
          auto username = user.name.section(QLatin1Char('\\'), -1);
@@ -476,7 +595,7 @@ index 723b513..c516eb9 100644
          auto password = user.password.toUtf8();
  
          std::array<uint8_t, 16> hash;
-@@ -156,18 +169,34 @@ out_fail:
+@@ -156,18 +171,34 @@ out_fail:
  
  static int pamAuthenticate(const QString &user, const QString &password)
  {
@@ -514,7 +633,7 @@ index 723b513..c516eb9 100644
          return -1;
      }
  
-@@ -175,6 +204,7 @@ static int pamAuthenticate(const QString &user, const QString &password)
+@@ -175,6 +206,7 @@ static int pamAuthenticate(const QString &user, const QString &password)
  
      if (pam_status != PAM_SUCCESS) {
          qWarning() << "pam_authenticate failure:" << pam_strerror(info.handle, pam_status);
@@ -522,7 +641,7 @@ index 723b513..c516eb9 100644
          return -1;
      }
  
-@@ -182,9 +212,11 @@ static int pamAuthenticate(const QString &user, const QString &password)
+@@ -182,9 +214,11 @@ static int pamAuthenticate(const QString &user, const QString &password)
  
      if (pam_status != PAM_SUCCESS) {
          qWarning() << "pam_acct_mgmt failure:" << pam_strerror(info.handle, pam_status);
@@ -534,15 +653,23 @@ index 723b513..c516eb9 100644
      return 1;
  }
  
-@@ -246,6 +278,7 @@ public:
+@@ -243,11 +277,15 @@ public:
+     Server *server = nullptr;
+ 
+     State state = State::Initial;
++    std::atomic<AuthState> authState{AuthState::Unauthenticated};
      bool qualitySeeded = false;
++    bool greeterStarted = false;
  
      qintptr socketHandle;
 +    TransportInfo transportInfo;
  
      std::unique_ptr<InputHandler> inputHandler;
++    std::unique_ptr<InBandGreeter> inBandGreeter;
      std::unique_ptr<VideoStream> videoStream;
-@@ -277,11 +310,17 @@ public:
+     std::unique_ptr<Cursor> cursor;
+     std::unique_ptr<NetworkDetection> networkDetection;
+@@ -277,13 +315,20 @@ public:
  };
  
  RdpConnection::RdpConnection(Server *server, qintptr socketHandle)
@@ -559,8 +686,136 @@ index 723b513..c516eb9 100644
 +    d->transportInfo = transportInfo;
  
      d->inputHandler = std::make_unique<InputHandler>(this);
++    d->inBandGreeter = std::make_unique<InBandGreeter>(this);
      d->videoStream = std::make_unique<VideoStream>(this);
-@@ -392,16 +431,76 @@ NetworkDetection *RdpConnection::networkDetection() const
+     connect(d->videoStream.get(), &VideoStream::closed, this, [this]() {
+         if (d->state == State::Running || d->state == State::Streaming) {
+@@ -296,6 +341,35 @@ RdpConnection::RdpConnection(Server *server, qintptr socketHandle)
+     d->clipboard = std::make_unique<Clipboard>(this);
+     d->displayControl = std::make_unique<DisplayControl>(this);
+ 
++    connect(d->inputHandler.get(), &InputHandler::inputEvent, d->inBandGreeter.get(), [this](const std::shared_ptr<QInputEvent> &event) {
++        if (d->authState.load(std::memory_order_acquire) == AuthState::PendingInBandGreeter) {
++            d->inBandGreeter->handleInputEvent(event);
++        }
++    });
++    connect(d->displayControl.get(), &DisplayControl::requestedScreenSizeChanged, d->inBandGreeter.get(), [this](const QSize &size) {
++        if (d->authState.load(std::memory_order_acquire) == AuthState::PendingInBandGreeter) {
++            d->inBandGreeter->setScreenSize(size);
++        }
++    });
++    connect(d->inBandGreeter.get(), &InBandGreeter::frameReady, this, [this](const QImage &image) {
++        if (d->authState.load(std::memory_order_acquire) != AuthState::PendingInBandGreeter) {
++            return;
++        }
++        VideoFrame frame;
++        frame.size = image.size();
++        frame.image = image;
++        frame.damage = QRegion(QRect(QPoint(0, 0), image.size()));
++        d->videoStream->queueFrame(frame);
++    });
++    connect(d->inBandGreeter.get(), &InBandGreeter::authenticated, this, [this](const QString &) {
++        setAuthState(AuthState::Authenticated);
++        d->videoStream->onSessionAuthenticated();
++    });
++    connect(d->inBandGreeter.get(), &InBandGreeter::failedAndClose, this, [this](const QString &reason) {
++        qCWarning(KRDP) << "Closing session from in-band greeter:" << reason;
++        close(CloseReason::None);
++    });
++
+     QMetaObject::invokeMethod(this, &RdpConnection::initialize, Qt::QueuedConnection);
+ }
+ 
+@@ -341,6 +415,88 @@ void RdpConnection::setState(KRdp::RdpConnection::State newState)
+     Q_EMIT stateChanged(newState);
+ }
+ 
++RdpConnection::AuthState RdpConnection::authState() const
++{
++    return d->authState.load(std::memory_order_acquire);
++}
++
++bool RdpConnection::isAuthenticated() const
++{
++    return d->authState.load(std::memory_order_acquire) == AuthState::Authenticated;
++}
++
++void RdpConnection::setAuthState(AuthState newAuthState)
++{
++    const AuthState prev = d->authState.exchange(newAuthState, std::memory_order_acq_rel);
++    if (prev == newAuthState) {
++        return;
++    }
++    Q_EMIT authStateChanged(newAuthState);
++    const bool wasAuth = (prev == AuthState::Authenticated);
++    const bool isAuth = (newAuthState == AuthState::Authenticated);
++    if (wasAuth != isAuth) {
++        Q_EMIT authenticatedChanged(isAuth);
++    }
++}
++
++InBandGreeter *RdpConnection::inBandGreeter() const
++{
++    return d->inBandGreeter.get();
++}
++
++void RdpConnection::startInBandGreeter()
++{
++    if (d->greeterStarted || d->authState.load(std::memory_order_acquire) != AuthState::PendingInBandGreeter) {
++        return;
++    }
++    d->greeterStarted = true;
++    QSize initialSize(1280, 720);
++    if (d->peer && d->peer->context && d->peer->context->settings) {
++        auto *settings = d->peer->context->settings;
++        const int w = static_cast<int>(freerdp_settings_get_uint32(settings, FreeRDP_DesktopWidth));
++        const int h = static_cast<int>(freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight));
++        if (w >= 640 && h >= 480) {
++            initialSize = QSize(w, h);
++        }
++    }
++    QString defaultUser = KUser().loginName();
++    if (defaultUser == QStringLiteral("plasmalogin") || isDisallowedLoginUser(defaultUser)) {
++        defaultUser.clear();
++    }
++    d->inBandGreeter->start(initialSize, defaultUser);
++}
++
++bool RdpConnection::verifyGuestCredentials(const QString &username, const QString &password) const
++{
++    const QString normalized = username.section(QLatin1Char('\\'), -1).trimmed();
++    if (normalized.isEmpty() || password.isEmpty() || isDisallowedLoginUser(normalized)) {
++        return false;
++    }
++
++    if (d->server->usePAMAuthentication()) {
++        qCDebug(KRDP) << "Attempting authenticating user with PAM";
++        if (normalized == KUser().loginName() || KUser().loginName() == QStringLiteral("plasmalogin")) {
++            if (pamAuthenticate(normalized, password) >= 0) {
++                qCDebug(KRDP) << "PAM authentication succeeded for user" << normalized;
++                return true;
++            }
++        }
++    }
++
++    const auto users = d->server->users();
++    for (const auto &user : users) {
++        if (user.password.isEmpty() || isDisallowedLoginUser(user.name)) {
++            continue;
++        }
++        if (user.name == normalized && user.password == password) {
++            qCDebug(KRDP) << "User" << normalized << "authenticated successfully";
++            return true;
++        }
++    }
++
++    return false;
++}
++
+ void RdpConnection::close(RdpConnection::CloseReason reason)
+ {
+     if (d->state == State::Closed) {
+@@ -392,16 +548,81 @@ NetworkDetection *RdpConnection::networkDetection() const
      return d->networkDetection.get();
  }
  
@@ -586,7 +841,12 @@ index 723b513..c516eb9 100644
  
 +    if (d->transportInfo.vmConnectMode) {
 +        bool verifiedVsockHostPeer = false;
-+#ifdef HAVE_LINUX_VM_SOCKETS_H
++#ifdef KRDP_VMCONNECT_TEST_HARNESS
++        // Compile-time-only test harness seam for autotests/vmconnectauthtest (NEVER defined in libKRdp.so or krdpserver).
++        if (d->transportInfo.transport == Server::Transport::Vsock && d->transportInfo.vsockPeerCid == d->server->allowedVsockPeerCid()) {
++            verifiedVsockHostPeer = true;
++        }
++#elif defined(HAVE_LINUX_VM_SOCKETS_H)
 +        if (d->transportInfo.transport == Server::Transport::Vsock && d->server->transport() == Server::Transport::Vsock && d->server->hyperVMode()) {
 +            sockaddr_storage peerStorage{};
 +            socklen_t peerLen = sizeof(peerStorage);
@@ -637,7 +897,7 @@ index 723b513..c516eb9 100644
      // Create an instance of our custom PeerContext extended context as context
      // rather than the plain rdpContext.
      d->peer->ContextSize = sizeof(PeerContext);
-@@ -411,6 +510,7 @@ void RdpConnection::initialize()
+@@ -411,6 +632,7 @@ void RdpConnection::initialize()
      auto result = freerdp_peer_context_new_ex(d->peer, d->server->rdpSettings());
      if (!result) {
          qCWarning(KRDP) << "Failed to create peer context";
@@ -645,7 +905,7 @@ index 723b513..c516eb9 100644
          return;
      }
  
-@@ -421,7 +521,7 @@ void RdpConnection::initialize()
+@@ -421,7 +643,7 @@ void RdpConnection::initialize()
  
      const bool usePamAuthentication = d->server->usePAMAuthentication();
  
@@ -654,7 +914,7 @@ index 723b513..c516eb9 100644
          if (!createSamFile(d->samFile, d->server->users())) {
              qFatal("Failed to create SAM database");
              return;
-@@ -436,6 +536,7 @@ void RdpConnection::initialize()
+@@ -436,6 +658,7 @@ void RdpConnection::initialize()
      auto certificate = freerdp_certificate_new_from_file(d->server->tlsCertificate().string().data());
      if (!certificate) {
          qCWarning(KRDP) << "Could not read certificate file" << d->server->tlsCertificate().string();
@@ -662,7 +922,7 @@ index 723b513..c516eb9 100644
          return;
      }
      freerdp_settings_set_pointer_len(settings, FreeRDP_RdpServerCertificate, certificate, 1);
-@@ -443,16 +544,34 @@ void RdpConnection::initialize()
+@@ -443,16 +666,34 @@ void RdpConnection::initialize()
      auto key = freerdp_key_new_from_file(d->server->tlsCertificateKey().string().data());
      if (!key) {
          qCWarning(KRDP) << "Could not read certificate file" << d->server->tlsCertificate().string();
@@ -703,21 +963,57 @@ index 723b513..c516eb9 100644
  
      freerdp_settings_set_uint32(settings, FreeRDP_OsMajorType, OSMAJORTYPE_UNIX);
      // PSEUDO_XSERVER is apparently required for things to work properly.
-@@ -681,24 +800,40 @@ bool RdpConnection::onPostConnect()
+@@ -491,7 +732,6 @@ void RdpConnection::initialize()
+     freerdp_settings_set_bool(settings, FreeRDP_SupportMonitorLayoutPdu, true);
+     freerdp_settings_set_bool(settings, FreeRDP_SupportDisplayControl, true);
+ 
+-
+     d->peer->Capabilities = peerCapabilities;
+     d->peer->Activate = peerActivate;
+     d->peer->PostConnect = peerPostConnect;
+@@ -568,7 +808,7 @@ void RdpConnection::run(std::stop_token stopToken)
+             break;
+         }
+ 
+-        if (d->peer->connected && d->state == State::Activated && cliprdrJoined) {
++        if (d->peer->connected && (d->state == State::Activated || d->state == State::Streaming) && cliprdrJoined && isAuthenticated()) {
+             if (!d->clipboard->initialize()) {
+                 break;
+             }
+@@ -595,6 +835,9 @@ void RdpConnection::run(std::stop_token stopToken)
+                     qCWarning(KRDP) << "Unable to open RDPGFX channel";
+                 } else {
+                     setState(State::Streaming);
++                    if (d->authState.load(std::memory_order_acquire) == AuthState::PendingInBandGreeter) {
++                        QMetaObject::invokeMethod(this, &RdpConnection::startInBandGreeter, Qt::QueuedConnection);
++                    }
+                 }
+             }
+         }
+@@ -628,7 +871,7 @@ bool RdpConnection::onCapabilities()
+         freerdp_settings_set_uint32(settings, FreeRDP_ColorDepth, 32);
+     }
+ 
+-    if (freerdp_settings_get_uint32(settings,FreeRDP_PointerCacheSize) <= 0) {
++    if (freerdp_settings_get_uint32(settings, FreeRDP_PointerCacheSize) <= 0) {
+         qCWarning(KRDP) << "Client doesn't support pointer caching, aborting";
+         return false;
+     }
+@@ -681,40 +924,55 @@ bool RdpConnection::onPostConnect()
      qCInfo(KRDP) << "New client connected:" << d->peer->hostname << freerdp_peer_os_major_type_string(d->peer) << freerdp_peer_os_minor_type_string(d->peer);
  
      rdpSettings *settings = d->peer->context->settings;
 -    const QString username = QString::fromLatin1(freerdp_settings_get_string(settings, FreeRDP_Username)).section(QLatin1Char('\\'), -1);
 +    const QString username = QString::fromUtf8(freerdp_settings_get_string(settings, FreeRDP_Username)).section(QLatin1Char('\\'), -1);
-+
+ 
+-    if (d->server->usePAMAuthentication()) {
 +    if (!username.isEmpty() && isDisallowedLoginUser(username)) {
 +        qCWarning(KRDP) << "Rejecting disallowed RDP login user:" << username;
 +        return false;
 +    }
 +
 +    const bool requirePostConnectAuth = d->server->usePAMAuthentication() || d->transportInfo.vmConnectMode;
- 
--    if (d->server->usePAMAuthentication()) {
++
 +    if (requirePostConnectAuth) {
          if (!freerdp_settings_set_bool(settings, FreeRDP_AutoLogonEnabled, true)) {
              return false;
@@ -728,50 +1024,59 @@ index 723b513..c516eb9 100644
 -        if (username == KUser().loginName() || KUser().loginName() == QStringLiteral("plasmalogin")) {
 -            if (pamAuthenticate(username, password) >= 0) {
 -                qCDebug(KRDP) << "PAM authentication succeeded for user" << username;
--                return true;
 +        const QString password = QString::fromUtf8(freerdp_settings_get_string(settings, FreeRDP_Password));
-+        if (username.isEmpty() || password.isEmpty()) {
-+            qCWarning(KRDP) << "Rejecting unauthenticated RDP connection (missing username or password in TS_INFO_PACKET)"
-+                            << (d->transportInfo.vmConnectMode ? "[Hyper-V VMConnect mode]" : "");
-+            return false;
-+        }
-+
-+        if (d->server->usePAMAuthentication()) {
-+            qCDebug(KRDP) << "Attempting authenticating user with PAM";
-+            if (username == KUser().loginName() || KUser().loginName() == QStringLiteral("plasmalogin")) {
-+                if (pamAuthenticate(username, password) >= 0) {
-+                    qCDebug(KRDP) << "PAM authentication succeeded for user" << username;
-+                    return true;
-+                }
-             }
-         }
-+
-         const auto users = d->server->users();
--        for (auto user : users) {
--            if (user.password.isEmpty()) {
-+        for (const auto &user : users) {
-+            if (user.password.isEmpty() || isDisallowedLoginUser(user.name)) {
-                 continue;
-             }
-             if (user.name == username && user.password == password) {
-@@ -706,9 +841,11 @@ bool RdpConnection::onPostConnect()
++        if (password.isEmpty()) {
++            if (d->transportInfo.vmConnectMode && d->transportInfo.inBandGreeterEnabled) {
++                qCInfo(KRDP) << "Hyper-V VMConnect peer sent no password in TS_INFO_PACKET; entering isolated in-band login greeter";
++                setAuthState(AuthState::PendingInBandGreeter);
                  return true;
              }
++            qCWarning(KRDP) << "Rejecting unauthenticated RDP connection (missing password in TS_INFO_PACKET)"
++                            << (d->transportInfo.vmConnectMode ? "[Hyper-V VMConnect mode]" : "");
++            return false;
          }
+-        const auto users = d->server->users();
+-        for (auto user : users) {
+-            if (user.password.isEmpty()) {
+-                continue;
+-            }
+-            if (user.name == username && user.password == password) {
+-                qCDebug(KRDP) << "User" << username << "authenticated successfully";
+-                return true;
+-            }
++
++        if (username.isEmpty()) {
++            qCWarning(KRDP) << "Rejecting unauthenticated RDP connection (missing username in TS_INFO_PACKET)";
++            return false;
+         }
++
++        if (verifyGuestCredentials(username, password)) {
++            setAuthState(AuthState::Authenticated);
++            return true;
++        }
++
 +        qCWarning(KRDP) << "Authentication failed for user" << username;
          return false;
      } else {
 -        // In the NLA case the user has been authorised against the SAM database
 +        // In the standard TCP NLA case, the user has been authorised against the SAM database
 +        // (from which disallowed/root users are excluded).
++        setAuthState(AuthState::Authenticated);
          return true;
      }
  }
+ 
+ bool RdpConnection::onClose()
+ {
++    QMetaObject::invokeMethod(d->inBandGreeter.get(), &InBandGreeter::stop, Qt::QueuedConnection);
+     d->displayControl->close();
+     d->clipboard->close();
+     d->videoStream->close();
 diff --git a/src/RdpConnection.h b/src/RdpConnection.h
-index 531b9f0..de9eb79 100644
+index 531b9f0..51a7d5d 100644
 --- a/src/RdpConnection.h
 +++ b/src/RdpConnection.h
-@@ -11,6 +11,7 @@
+@@ -11,12 +11,14 @@
  
  #include <freerdp/freerdp.h>
  
@@ -779,16 +1084,36 @@ index 531b9f0..de9eb79 100644
  #include "krdp_export.h"
  
  namespace KRdp
-@@ -61,6 +62,16 @@ public:
+ {
+ 
+ class InputHandler;
++class InBandGreeter;
+ class Server;
+ class VideoStream;
+ class VideoStreamSurface;
+@@ -61,6 +63,29 @@ public:
          VideoInitFailed, ///< VideoStream failed to initialize.
      };
  
++    /**
++     * Authentication state of this RDP connection.
++     *
++     * Desktop screencasting, KWin EIS input, and Clipboard MUST NOT be attached
++     * until authState() == AuthState::Authenticated.
++     */
++    enum class AuthState {
++        Unauthenticated,
++        PendingInBandGreeter,
++        Authenticated,
++    };
++
 +    /**
 +     * Transport metadata for an accepted connection.
 +     */
 +    struct TransportInfo {
 +        Server::Transport transport = Server::Transport::Tcp;
 +        bool vmConnectMode = false;
++        bool inBandGreeterEnabled = false;
 +        quint32 vsockPeerCid = 0;
 +        quint32 vsockPeerPort = 0;
 +    };
@@ -796,7 +1121,7 @@ index 531b9f0..de9eb79 100644
      /**
       * Constructor.
       *
-@@ -69,8 +80,14 @@ public:
+@@ -69,14 +94,39 @@ public:
       *                     for communication.
       */
      explicit RdpConnection(Server *server, qintptr socketHandle);
@@ -811,8 +1136,42 @@ index 531b9f0..de9eb79 100644
      /**
       * The current session state.
       */
+     State state() const;
+     Q_SIGNAL void stateChanged(State newState);
+ 
++    /**
++     * The current authentication state.
++     */
++    AuthState authState() const;
++    bool isAuthenticated() const;
++    Q_SIGNAL void authStateChanged(AuthState newAuthState);
++    Q_SIGNAL void authenticatedChanged(bool authenticated);
++
++    /**
++     * Validate guest username/password against PAM and/or configured non-root KRdp users.
++     */
++    bool verifyGuestCredentials(const QString &username, const QString &password) const;
++
++    /**
++     * The isolated in-band greeter used when a Hyper-V VMConnect peer connects without
++     * a password in TS_INFO_PACKET.
++     */
++    InBandGreeter *inBandGreeter() const;
++
+     /**
+      * Close the connection
+      *
+@@ -118,6 +168,8 @@ private:
+     friend class DisplayControl;
+ 
+     void setState(State newState);
++    void setAuthState(AuthState newAuthState);
++    void startInBandGreeter();
+     void initialize();
+     void run(std::stop_token stopToken);
+ 
 diff --git a/src/Server.cpp b/src/Server.cpp
-index 4ccb3ba..6539a12 100644
+index 4ccb3ba..92c09a1 100644
 --- a/src/Server.cpp
 +++ b/src/Server.cpp
 @@ -4,9 +4,18 @@
@@ -834,7 +1193,7 @@ index 4ccb3ba..6539a12 100644
  
  #include <freerdp/channels/channels.h>
  #include <freerdp/freerdp.h>
-@@ -18,12 +27,30 @@
+@@ -18,12 +27,31 @@
  
  using namespace KRdp;
  
@@ -857,6 +1216,7 @@ index 4ccb3ba..6539a12 100644
  
 +    Transport transport = Transport::Tcp;
 +    bool hyperVMode = false;
++    bool inBandGreeterEnabled = false;
 +    quint32 vsockBindCid = DefaultVsockBindCid;
 +    quint32 allowedVsockPeerCid = DefaultVsockPeerCid;
 +    int vsockFd = -1;
@@ -865,7 +1225,7 @@ index 4ccb3ba..6539a12 100644
      QHostAddress address = QHostAddress::LocalHost;
      quint16 port = 3389;
  
-@@ -55,10 +82,122 @@ bool Server::start()
+@@ -55,10 +83,127 @@ bool Server::start()
          return false;
      }
  
@@ -875,6 +1235,10 @@ index 4ccb3ba..6539a12 100644
 +    if (d->transport == Transport::Tcp) {
 +        if (d->hyperVMode) {
 +            qCCritical(KRDP) << "Hyper-V VMConnect mode is strictly restricted to AF_VSOCK transport and cannot be enabled on TCP";
++            return false;
++        }
++        if (d->inBandGreeterEnabled) {
++            qCCritical(KRDP) << "In-band greeter mode is strictly restricted to AF_VSOCK Hyper-V VMConnect transport and cannot be enabled on TCP";
 +            return false;
 +        }
 +
@@ -958,6 +1322,7 @@ index 4ccb3ba..6539a12 100644
 +                RdpConnection::TransportInfo info;
 +                info.transport = Transport::Vsock;
 +                info.vmConnectMode = d->hyperVMode;
++                info.inBandGreeterEnabled = d->hyperVMode && d->inBandGreeterEnabled;
 +                info.vsockPeerCid = peerAddr.svm_cid;
 +                info.vsockPeerPort = peerAddr.svm_port;
 +
@@ -991,7 +1356,7 @@ index 4ccb3ba..6539a12 100644
      }
  
      // FreeRDP3 tries to use a global instance of the settings object when
-@@ -66,12 +205,28 @@ bool Server::start()
+@@ -66,12 +211,28 @@ bool Server::start()
      // global default instance. So create one here and use that.
      d->settings = freerdp_settings_new(FREERDP_SETTINGS_SERVER_MODE);
  
@@ -1021,7 +1386,7 @@ index 4ccb3ba..6539a12 100644
      close();
  
      if (d->settings) {
-@@ -80,6 +235,54 @@ void Server::stop()
+@@ -80,6 +241,64 @@ void Server::stop()
      }
  }
  
@@ -1043,6 +1408,16 @@ index 4ccb3ba..6539a12 100644
 +void Server::setHyperVMode(bool enabled)
 +{
 +    d->hyperVMode = enabled;
++}
++
++bool Server::inBandGreeterEnabled() const
++{
++    return d->inBandGreeterEnabled;
++}
++
++void Server::setInBandGreeterEnabled(bool enabled)
++{
++    d->inBandGreeterEnabled = enabled;
 +}
 +
 +quint32 Server::vsockBindCid() const
@@ -1077,7 +1452,7 @@ index 4ccb3ba..6539a12 100644
  {
      return d->address;
 diff --git a/src/Server.h b/src/Server.h
-index 5fcd298..e136cbe 100644
+index 5fcd298..ad1d6cc 100644
 --- a/src/Server.h
 +++ b/src/Server.h
 @@ -39,13 +39,19 @@ class KRDP_EXPORT Server : public QTcpServer
@@ -1101,7 +1476,7 @@ index 5fcd298..e136cbe 100644
       * changing them after the server has started listening has no effect.
       */
      bool start();
-@@ -54,6 +60,46 @@ public:
+@@ -54,6 +60,56 @@ public:
       */
      void stop();
  
@@ -1122,6 +1497,16 @@ index 5fcd298..e136cbe 100644
 +     */
 +    bool hyperVMode() const;
 +    void setHyperVMode(bool enabled);
++
++    /**
++     * Whether the isolated in-band login greeter is enabled for Hyper-V VMConnect
++     * connections that do not send a password in TS_INFO_PACKET (e.g. vmconnect.exe).
++     *
++     * Strictly restricted to Transport::Vsock with hyperVMode() == true.
++     * Enabling it on Transport::Tcp causes start() to fail.
++     */
++    bool inBandGreeterEnabled() const;
++    void setInBandGreeterEnabled(bool enabled);
 +
 +    /**
 +     * The AF_VSOCK CID to bind to when transport() == Transport::Vsock.
@@ -1148,3 +1533,71 @@ index 5fcd298..e136cbe 100644
      /**
       * The host address to listen on.
       *
+@@ -84,7 +140,6 @@ public:
+     void setUsers(const QList<User> &users);
+     void addUser(const User &user);
+ 
+-
+     /** Whether to authenticate against PAM for the user running the daemon
+      */
+     bool usePAMAuthentication() const;
+diff --git a/src/VideoStream.cpp b/src/VideoStream.cpp
+index 558a518..a2d1862 100644
+--- a/src/VideoStream.cpp
++++ b/src/VideoStream.cpp
+@@ -149,6 +149,7 @@ public:
+ 
+     RdpConnection *session;
+     std::optional<EncodingMode> activeEncodingMode;
++    EncodingMode negotiatedDesktopMode = EncodingMode::Progressive;
+     std::unique_ptr<VideoStreamSurface> surface;
+ 
+     RdpGfxContextPtr gfxContext = RdpGfxContextPtr(nullptr, rdpgfx_server_context_free);
+@@ -506,6 +507,15 @@ void VideoStream::setPipeWireSource(quint32 nodeId, quint64 objectSerial, int fd
+     d->surface->setPipeWireSource(nodeId, objectSerial, fd);
+ }
+ 
++void VideoStream::onSessionAuthenticated()
++{
++    if (!d->initialized) {
++        return;
++    }
++    d->surface->pendingReset = true;
++    setActiveEncodingMode(d->negotiatedDesktopMode);
++}
++
+ bool VideoStream::onChannelIdAssigned(uint32_t channelId)
+ {
+     d->channelId = channelId;
+@@ -589,13 +599,16 @@ uint32_t VideoStream::onCapsAdvertise(const RDPGFX_CAPS_ADVERTISE_PDU *capsAdver
+         return CHANNEL_RC_INITIALIZATION_ERROR;
+     }
+ 
++    d->negotiatedDesktopMode = negotiatedMode;
++    const EncodingMode initialMode = d->session->isAuthenticated() ? negotiatedMode : EncodingMode::Progressive;
++
+     QMetaObject::invokeMethod(
+         this,
+-        [this, negotiatedMode]() {
+-            setActiveEncodingMode(negotiatedMode);
++        [this, initialMode]() {
++            setActiveEncodingMode(initialMode);
+         },
+         Qt::BlockingQueuedConnection); // RDP callbacks are on the connection thread, VideoStream operates on the main thread
+-    qCDebug(KRDP) << "Selected encoding mode:" << encodingModeName(negotiatedMode);
++    qCDebug(KRDP) << "Selected encoding mode:" << encodingModeName(initialMode) << (d->session->isAuthenticated() ? "" : "(in-band greeter mode)");
+ 
+     auto maxVersion = std::max_element(capsInformation.begin(), capsInformation.end(), [](const auto &first, const auto &second) {
+         return first.version < second.version;
+diff --git a/src/VideoStream.h b/src/VideoStream.h
+index d92ff42..43c299b 100644
+--- a/src/VideoStream.h
++++ b/src/VideoStream.h
+@@ -89,6 +89,7 @@ public:
+     void seedQuality(quint8 quality);
+     void setRequestedSize(const QSize &size);
+     void setPipeWireSource(quint32 nodeId, quint64 objectSerial, int fd = -1);
++    void onSessionAuthenticated();
+ 
+     bool openChannel();
+ 

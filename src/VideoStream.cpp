@@ -149,6 +149,7 @@ public:
 
     RdpConnection *session;
     std::optional<EncodingMode> activeEncodingMode;
+    EncodingMode negotiatedDesktopMode = EncodingMode::Progressive;
     std::unique_ptr<VideoStreamSurface> surface;
 
     RdpGfxContextPtr gfxContext = RdpGfxContextPtr(nullptr, rdpgfx_server_context_free);
@@ -506,6 +507,15 @@ void VideoStream::setPipeWireSource(quint32 nodeId, quint64 objectSerial, int fd
     d->surface->setPipeWireSource(nodeId, objectSerial, fd);
 }
 
+void VideoStream::onSessionAuthenticated()
+{
+    if (!d->initialized) {
+        return;
+    }
+    d->surface->pendingReset = true;
+    setActiveEncodingMode(d->negotiatedDesktopMode);
+}
+
 bool VideoStream::onChannelIdAssigned(uint32_t channelId)
 {
     d->channelId = channelId;
@@ -589,13 +599,16 @@ uint32_t VideoStream::onCapsAdvertise(const RDPGFX_CAPS_ADVERTISE_PDU *capsAdver
         return CHANNEL_RC_INITIALIZATION_ERROR;
     }
 
+    d->negotiatedDesktopMode = negotiatedMode;
+    const EncodingMode initialMode = d->session->isAuthenticated() ? negotiatedMode : EncodingMode::Progressive;
+
     QMetaObject::invokeMethod(
         this,
-        [this, negotiatedMode]() {
-            setActiveEncodingMode(negotiatedMode);
+        [this, initialMode]() {
+            setActiveEncodingMode(initialMode);
         },
         Qt::BlockingQueuedConnection); // RDP callbacks are on the connection thread, VideoStream operates on the main thread
-    qCDebug(KRDP) << "Selected encoding mode:" << encodingModeName(negotiatedMode);
+    qCDebug(KRDP) << "Selected encoding mode:" << encodingModeName(initialMode) << (d->session->isAuthenticated() ? "" : "(in-band greeter mode)");
 
     auto maxVersion = std::max_element(capsInformation.begin(), capsInformation.end(), [](const auto &first, const auto &second) {
         return first.version < second.version;

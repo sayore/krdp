@@ -89,6 +89,7 @@ public:
     void seedQuality(quint8 quality);
     void setRequestedSize(const QSize &size);
     void setPipeWireSource(quint32 nodeId, quint64 objectSerial, int fd = -1);
+    void onSessionAuthenticated();
 
     bool openChannel();
 
