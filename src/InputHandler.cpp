@@ -70,6 +70,8 @@ public:
     // Keycodes the client currently holds, so they can be released if a key-release
     // is lost and the client re-synchronizes its keyboard state.
     QSet<quint32> pressedKeys;
+    uint16_t pendingHighSurrogatePress = 0;
+    uint16_t pendingHighSurrogateRelease = 0;
 };
 
 InputHandler::InputHandler(KRdp::RdpConnection *session)
@@ -97,6 +99,8 @@ bool InputHandler::synchronizeEvent(uint32_t /*flags*/)
 {
     // Client is resynchronizing its keyboard state; release any keys we still
     // believe are held so a lost key-release does not leave a key stuck down.
+    d->pendingHighSurrogatePress = 0;
+    d->pendingHighSurrogateRelease = 0;
     const auto stuck = d->pressedKeys;
     d->pressedKeys.clear();
     if (!stuck.isEmpty()) {
@@ -192,7 +196,8 @@ bool InputHandler::extendedMouseEvent(uint16_t x, uint16_t y, uint16_t flags)
     } else if (flags & PTR_XFLAGS_BUTTON2) {
         button = Qt::ForwardButton;
     } else {
-        return false;
+        // Ignore unrecognized extended mouse flags instead of failing the RDP input PDU.
+        return true;
     }
 
     std::shared_ptr<QMouseEvent> event;
@@ -213,6 +218,9 @@ bool InputHandler::keyboardEvent(uint16_t code, uint16_t flags)
     virtualCode = flags & KBD_FLAGS_EXTENDED ? virtualCode | KBDEXT : virtualCode;
 
     quint32 keycode = GetKeycodeFromVirtualKeyCode(virtualCode, WINPR_KEYCODE_TYPE_EVDEV);
+    if (keycode == 0) {
+        return true;
+    }
 
     auto type = flags & KBD_FLAGS_RELEASE ? QEvent::KeyRelease : QEvent::KeyPress;
 
@@ -230,13 +238,31 @@ bool InputHandler::keyboardEvent(uint16_t code, uint16_t flags)
 
 bool InputHandler::unicodeKeyboardEvent(uint16_t code, uint16_t flags)
 {
-    auto text = QString(QChar::fromUcs2(code));
-    auto keysym = xkb_utf32_to_keysym(text.toUcs4().first());
-    if (!keysym) {
+    const bool isRelease = (flags & KBD_FLAGS_RELEASE) != 0;
+    uint16_t &pendingHigh = isRelease ? d->pendingHighSurrogateRelease : d->pendingHighSurrogatePress;
+
+    uint32_t codePoint = 0;
+    if (QChar::isHighSurrogate(code)) {
+        pendingHigh = code;
+        return true;
+    }
+    if (QChar::isLowSurrogate(code)) {
+        if (pendingHigh == 0) {
+            return true;
+        }
+        codePoint = QChar::surrogateToUcs4(pendingHigh, code);
+        pendingHigh = 0;
+    } else {
+        pendingHigh = 0;
+        codePoint = code;
+    }
+
+    const xkb_keysym_t keysym = xkb_utf32_to_keysym(codePoint);
+    if (keysym == XKB_KEY_NoSymbol) {
         return true;
     }
 
-    auto type = flags & KBD_FLAGS_RELEASE ? QEvent::KeyRelease : QEvent::KeyPress;
+    auto type = isRelease ? QEvent::KeyRelease : QEvent::KeyPress;
 
     auto event = std::make_shared<QKeyEvent>(type, 0, Qt::KeyboardModifiers{}, 0, keysym, 0);
     Q_EMIT inputEvent(event);
