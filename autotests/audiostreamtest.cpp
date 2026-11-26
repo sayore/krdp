@@ -70,21 +70,23 @@ private Q_SLOTS:
 
     void testSelectBestClientFormat()
     {
-        // Prefers 48kHz stereo 16-bit PCM over MP3, 44.1kHz stereo, and 48kHz mono
-        const std::array<AUDIO_FORMAT, 4> formats = {
+        // Prefers 44.1kHz stereo 16-bit PCM (Windows client render rate) over MP3, 48kHz stereo, and 48kHz mono,
+        // using the exact format list advertised by Hyper-V VMConnect / mstsc.
+        const std::array<AUDIO_FORMAT, 5> formats = {
             makeFmt(WAVE_FORMAT_MPEGLAYER3, 2, 48000, 16),
+            makeFmt(WAVE_FORMAT_PCM, 2, 48000, 16),
             makeFmt(WAVE_FORMAT_PCM, 2, 44100, 16),
             makeFmt(WAVE_FORMAT_PCM, 1, 48000, 16),
-            makeFmt(WAVE_FORMAT_PCM, 2, 48000, 16),
+            makeFmt(WAVE_FORMAT_PCM, 1, 44100, 16),
         };
         const auto best = KRdp::AudioStream::selectBestClientFormat(formats.data(), static_cast<uint16_t>(formats.size()));
         QVERIFY(best.has_value());
-        QCOMPARE(*best, uint16_t(3));
+        QCOMPARE(*best, uint16_t(2));
 
-        // Falls back to 44.1kHz stereo when 48kHz stereo is absent
+        // Falls back to 48kHz stereo when 44.1kHz stereo is absent (stereo beats mono)
         const std::array<AUDIO_FORMAT, 2> fallback = {
-            makeFmt(WAVE_FORMAT_PCM, 1, 48000, 16),
-            makeFmt(WAVE_FORMAT_PCM, 2, 44100, 16),
+            makeFmt(WAVE_FORMAT_PCM, 1, 44100, 16),
+            makeFmt(WAVE_FORMAT_PCM, 2, 48000, 16),
         };
         const auto bestFallback = KRdp::AudioStream::selectBestClientFormat(fallback.data(), static_cast<uint16_t>(fallback.size()));
         QVERIFY(bestFallback.has_value());
