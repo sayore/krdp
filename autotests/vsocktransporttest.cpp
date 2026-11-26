@@ -74,6 +74,21 @@ private Q_SLOTS:
         QVERIFY(!server.isListeningTransport());
     }
 
+    void testTcpRejectsInBandGreeter()
+    {
+        KRdp::Server server;
+        server.setTransport(KRdp::Server::Transport::Tcp);
+        server.setHyperVMode(false);
+        server.setInBandGreeterEnabled(true);
+        server.setAddress(QHostAddress::LocalHost);
+        server.setPort(0);
+        server.setTlsCertificate(m_certPath);
+        server.setTlsCertificateKey(m_keyPath);
+
+        QVERIFY(!server.start());
+        QVERIFY(!server.isListeningTransport());
+    }
+
     void testVsockRejectsWildcardPeerCid()
     {
 #ifdef HAVE_LINUX_VM_SOCKETS_H

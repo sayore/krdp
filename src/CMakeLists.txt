@@ -22,6 +22,8 @@ target_sources(KRdp PRIVATE
     DisplayControl.h
     EiConnection.cpp
     EiConnection.h
+    InBandGreeter.cpp
+    InBandGreeter.h
     RdpConnection.cpp
     Server.cpp
     Server.h

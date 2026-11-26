@@ -72,6 +72,9 @@ int main(int argc, char **argv)
         {u"transport"_s, u"The transport to listen on: tcp (default) or vsock (Hyper-V Enhanced Session AF_VSOCK)."_s, u"transport"_s, u"tcp"_s},
         {u"vmconnect"_s, u"Enable Hyper-V VMConnect mode (only valid with --transport vsock; enabled by default for vsock)."_s},
         {u"no-vmconnect"_s, u"Disable Hyper-V VMConnect mode on --transport vsock and require full TLS/NLA."_s},
+        {u"in-band-greeter"_s,
+         u"Enable isolated in-band login greeter for Hyper-V VMConnect clients that omit a password in TS_INFO_PACKET (default: on for vsock vmconnect)."_s},
+        {u"no-in-band-greeter"_s, u"Disable the in-band login greeter and reject connections that omit a password in TS_INFO_PACKET."_s},
         {u"vsock-cid"_s, u"The AF_VSOCK CID to bind to when using --transport vsock (numeric CID or 'any', default: any)."_s, u"cid"_s, u"any"_s},
         {u"vsock-peer-cid"_s, u"The only AF_VSOCK peer CID permitted to connect (default: 2 / VMADDR_CID_HOST)."_s, u"cid"_s, u"2"_s},
         {u"pam"_s, u"Enable PAM authentication for the current non-root user."_s},
@@ -125,9 +128,20 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    if (parser.isSet(u"in-band-greeter"_s) && parser.isSet(u"no-in-band-greeter"_s)) {
+        qWarning() << "--in-band-greeter and --no-in-band-greeter cannot be combined";
+        return 1;
+    }
+
     const bool hyperVMode = (*transport == KRdp::Server::Transport::Vsock) ? !parser.isSet(u"no-vmconnect"_s) : parser.isSet(u"vmconnect"_s);
     if (hyperVMode && *transport != KRdp::Server::Transport::Vsock) {
         qWarning() << "--vmconnect is strictly restricted to --transport vsock and cannot be used with TCP";
+        return 1;
+    }
+
+    const bool inBandGreeter = hyperVMode ? !parser.isSet(u"no-in-band-greeter"_s) : parser.isSet(u"in-band-greeter"_s);
+    if (inBandGreeter && !hyperVMode) {
+        qWarning() << "--in-band-greeter is strictly restricted to --transport vsock with --vmconnect";
         return 1;
     }
 
@@ -143,6 +157,7 @@ int main(int argc, char **argv)
 
     server.setTransport(*transport);
     server.setHyperVMode(hyperVMode);
+    server.setInBandGreeterEnabled(inBandGreeter);
     if (*transport == KRdp::Server::Transport::Vsock) {
         const QString bindCidStr = parser.value(u"vsock-cid"_s).trimmed().toLower();
         if (bindCidStr != u"any"_s) {
