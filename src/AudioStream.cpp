@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <thread>
@@ -78,9 +79,12 @@ int scorePcmFormat(const AUDIO_FORMAT &fmt)
     if (fmt.nChannels == 2) {
         score += 100;
     }
-    if (fmt.nSamplesPerSec == 48000) {
+    // Prefer 44.1 kHz: Windows RDP clients (mstsc / Hyper-V VMConnect) advertise 48 kHz but were
+    // measured to render RDPSND PCM at 44.1 kHz, which makes the client playout queue grow by ~8%
+    // (~5 s per minute). 44.1 kHz is also what Windows RDP servers send by default.
+    if (fmt.nSamplesPerSec == 44100) {
         score += 50;
-    } else if (fmt.nSamplesPerSec == 44100) {
+    } else if (fmt.nSamplesPerSec == 48000) {
         score += 40;
     } else if (fmt.nSamplesPerSec == 32000) {
         score += 20;
@@ -232,6 +236,12 @@ public:
     std::atomic<uint16_t> selectedFormatIndex{0};
     std::atomic<int> inFlightBlocks{0};
     std::atomic<uint64_t> lastConfirmSteadyMs{0};
+
+    // Client-side playout delay measurement (MS-RDPEA Wave Confirm echoes the wave timestamp
+    // plus the client's render delay). Indexed by the 8-bit RDPSND block number.
+    std::array<std::atomic<uint16_t>, 256> sentTimestamps{};
+    std::atomic<int> clientDelayMs{-1}; // smoothed (EWMA), -1 = no sample yet
+    std::atomic<int> clientDelayPeakMs{0};
 
     // Pre-allocated lock-free SPSC ring buffer between PipeWire RT thread and TX thread.
     std::mutex captureLifecycleMutex;
@@ -464,10 +474,20 @@ BOOL AudioStream::Private::onChannelIdAssigned(RdpsndServerContext *, UINT32 cha
     return TRUE;
 }
 
-UINT AudioStream::Private::onConfirmBlock(RdpsndServerContext *, BYTE, UINT16)
+UINT AudioStream::Private::onConfirmBlock(RdpsndServerContext *, BYTE confirmBlockNum, UINT16 wTimestamp)
 {
     int current = inFlightBlocks.load(std::memory_order_relaxed);
     while (current > 0 && !inFlightBlocks.compare_exchange_weak(current, current - 1, std::memory_order_acq_rel)) { }
+
+    const uint16_t sentTs = sentTimestamps[confirmBlockNum].load(std::memory_order_acquire);
+    const int delay = static_cast<uint16_t>(wTimestamp - sentTs);
+    if (delay < 5000) { // ignore wrapped / bogus confirms
+        const int prev = clientDelayMs.load(std::memory_order_relaxed);
+        clientDelayMs.store(prev < 0 ? delay : (prev * 7 + delay) / 8, std::memory_order_release);
+        if (delay > clientDelayPeakMs.load(std::memory_order_relaxed)) {
+            clientDelayPeakMs.store(delay, std::memory_order_relaxed);
+        }
+    }
     const auto nowMs =
         static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
     lastConfirmSteadyMs.store(nowMs, std::memory_order_release);
@@ -525,9 +545,11 @@ bool AudioStream::Private::startPipeWireCaptureLocked(uint32_t sampleRate, uint1
         pw_init(nullptr, nullptr);
     });
 
-    framesPerChunk = std::max<size_t>(120, sampleRate / 200); // ~5 ms ultra-low-latency RDPSND packet (240 frames @ 48 kHz)
+    // ~10 ms RDPSND packets (480 frames @ 48 kHz). 5 ms packets caused frequent client underruns
+    // on VMBus scheduling jitter, which made the Windows client grow its playout buffer over time.
+    framesPerChunk = std::max<size_t>(240, sampleRate / 100);
     samplesPerChunk = framesPerChunk * channels;
-    // Bounded ultra-low-latency ring buffer (~40 ms minimum, rounded to power-of-two) allocated ONCE before RT thread starts.
+    // Bounded ring buffer (~80 ms minimum, rounded to power-of-two) allocated ONCE before RT thread starts.
     ringBuffer.configure(samplesPerChunk * 8);
 
     if (wakeEventFd < 0) {
@@ -657,10 +679,33 @@ void AudioStream::Private::onActivated(RdpsndServerContext *context)
         return;
     }
 
-    const auto selectedIdx = AudioStream::selectBestClientFormat(context->client_formats, context->num_client_formats);
+    for (uint16_t i = 0; i < context->num_client_formats; ++i) {
+        const AUDIO_FORMAT &f = context->client_formats[i];
+        qCInfo(KRDP) << "RDPSND client format" << i << ": tag=" << f.wFormatTag << "rate=" << f.nSamplesPerSec << "ch=" << f.nChannels
+                     << "bits=" << f.wBitsPerSample;
+    }
+
+    auto selectedIdx = AudioStream::selectBestClientFormat(context->client_formats, context->num_client_formats);
     if (!selectedIdx) {
         qCWarning(KRDP) << "RDPSND client offered no compatible 16-bit PCM audio formats (count=" << context->num_client_formats << ")";
         return;
+    }
+
+    // Diagnostic override: KRDP_RDPSND_RATE=44100 forces a specific client sample rate (best channel count wins).
+    if (const QByteArray forced = qgetenv("KRDP_RDPSND_RATE"); !forced.isEmpty()) {
+        const uint32_t wantedRate = forced.toUInt();
+        std::optional<uint16_t> overrideIdx;
+        for (uint16_t i = 0; i < context->num_client_formats; ++i) {
+            const AUDIO_FORMAT &f = context->client_formats[i];
+            if (f.wFormatTag == WAVE_FORMAT_PCM && f.wBitsPerSample == 16 && f.nSamplesPerSec == wantedRate && f.nChannels >= 1 && f.nChannels <= 2
+                && (!overrideIdx || f.nChannels > context->client_formats[*overrideIdx].nChannels)) {
+                overrideIdx = i;
+            }
+        }
+        if (overrideIdx) {
+            qCInfo(KRDP) << "RDPSND KRDP_RDPSND_RATE override selects client format" << *overrideIdx;
+            selectedIdx = overrideIdx;
+        }
     }
 
     const AUDIO_FORMAT &clientFmt = context->client_formats[*selectedIdx];
@@ -701,6 +746,8 @@ void AudioStream::Private::onActivated(RdpsndServerContext *context)
     }
     const size_t chunkFrames = framesPerChunk;
     const size_t chunkSamples = samplesPerChunk;
+    clientDelayMs.store(-1, std::memory_order_release);
+    clientDelayPeakMs.store(0, std::memory_order_relaxed);
     txThread = std::jthread([this, chunkFrames, chunkSamples](std::stop_token token) {
         runTxLoop(token, chunkFrames, chunkSamples);
     });
@@ -711,14 +758,36 @@ void AudioStream::Private::onActivated(RdpsndServerContext *context)
 void AudioStream::Private::runTxLoop(std::stop_token stopToken, size_t chunkFrames, size_t chunkSamples)
 {
     const auto startTime = std::chrono::steady_clock::now();
-    constexpr int SilenceTailChunks = 60; // 300 ms tail at 5 ms/chunk
-    constexpr int MaxInFlightBlocks = 3; // ~15 ms max in-flight latency over local AF_VSOCK
-    constexpr size_t MaxBufferedChunksBeforeTrim = 2; // trim stale backlog above ~10 ms down to ~5 ms
+    constexpr int SilenceTailChunks = 30; // 300 ms tail at 10 ms/chunk
+    constexpr int MaxInFlightBlocks = 12; // backstop only (~120 ms); client delay control does the real work
+    constexpr size_t MaxBufferedChunksBeforeTrim = 4; // server-side backlog above ~40 ms is stale
+    // Client playout delay control: above HighWater, drop chunks (preferring quiet ones) until LowWater.
+    constexpr int DelayHighWaterMs = 250;
+    constexpr int DelayLowWaterMs = 150;
+    constexpr int DelayForceDropMs = 500;
+    constexpr int QuietPeak = 2048; // ~-24 dBFS
+    constexpr int MinChunksBetweenDriftDrops = 3;
     int silentChunksRemaining = 0;
+    bool draining = false;
+    int chunksSinceDriftDrop = MinChunksBetweenDriftDrops;
+
+    uint64_t statSent = 0, statTrimmed = 0, statInFlightDrops = 0, statDriftDrops = 0;
+    auto lastStatLog = startTime;
 
     std::vector<int16_t> chunk(chunkSamples);
 
     while (!stopToken.stop_requested() && !closing.load(std::memory_order_acquire)) {
+        if (const auto now = std::chrono::steady_clock::now(); now - lastStatLog >= std::chrono::seconds(10)) {
+            lastStatLog = now;
+            if (statSent > 0 || statTrimmed > 0 || statInFlightDrops > 0 || statDriftDrops > 0) {
+                qCInfo(KRDP) << "RDPSND stats (10s): sent=" << statSent << "trimmed=" << statTrimmed << "inFlightDrops=" << statInFlightDrops
+                             << "driftDrops=" << statDriftDrops << "clientDelayMs=" << clientDelayMs.load(std::memory_order_acquire)
+                             << "peak=" << clientDelayPeakMs.exchange(0, std::memory_order_relaxed)
+                             << "inFlight=" << inFlightBlocks.load(std::memory_order_relaxed);
+            }
+            statSent = statTrimmed = statInFlightDrops = statDriftDrops = 0;
+        }
+
         const size_t avail = ringBuffer.available();
         if (avail < chunkSamples) {
             if (wakeEventFd >= 0) {
@@ -737,9 +806,10 @@ void AudioStream::Private::runTxLoop(std::stop_token stopToken, size_t chunkFram
             continue;
         }
 
-        // Keep latency pinned near the physical floor (~5 ms queued) by trimming stale excess backlog.
+        // Server-side backlog is bounded; anything beyond ~40 ms is stale.
         if (avail > chunkSamples * MaxBufferedChunksBeforeTrim) {
             ringBuffer.discard(avail - chunkSamples);
+            ++statTrimmed;
         }
 
         const size_t got = ringBuffer.read(chunk.data(), chunkSamples);
@@ -762,9 +832,35 @@ void AudioStream::Private::runTxLoop(std::stop_token stopToken, size_t chunkFram
 
         if (inFlightBlocks.load(std::memory_order_acquire) >= MaxInFlightBlocks) {
             const uint64_t lastConf = lastConfirmSteadyMs.load(std::memory_order_acquire);
-            if (lastConf != 0 && (nowMs - lastConf) > 150) {
+            if (lastConf != 0 && (nowMs - lastConf) > 1000) { // only recover from lost confirms; otherwise in-flight cap is real backpressure
                 inFlightBlocks.store(0, std::memory_order_release);
             } else {
+                ++statInFlightDrops;
+                continue;
+            }
+        }
+
+        // Client playout delay control (hysteresis). Dropping whole chunks is the only lever
+        // RDPSND gives us to shrink the Windows client's playout queue during continuous audio.
+        const int delay = clientDelayMs.load(std::memory_order_acquire);
+        if (delay > DelayHighWaterMs) {
+            draining = true;
+        } else if (delay >= 0 && delay <= DelayLowWaterMs) {
+            draining = false;
+        }
+        ++chunksSinceDriftDrop;
+        if (draining && chunksSinceDriftDrop > MinChunksBetweenDriftDrops) {
+            int peak = 0;
+            for (size_t i = 0; i < chunkSamples; ++i) {
+                peak = std::max(peak, std::abs(static_cast<int>(chunk[i])));
+            }
+            if (peak < QuietPeak || delay > DelayForceDropMs) {
+                chunksSinceDriftDrop = 0;
+                ++statDriftDrops;
+                // Assume one chunk less is queued until the next confirm refreshes the estimate.
+                const int chunkMs = static_cast<int>(chunkFrames * 1000 / std::max<uint32_t>(1, srcFormat.nSamplesPerSec));
+                int expected = delay;
+                clientDelayMs.compare_exchange_strong(expected, std::max(0, delay - chunkMs), std::memory_order_acq_rel);
                 continue;
             }
         }
@@ -775,6 +871,7 @@ void AudioStream::Private::runTxLoop(std::stop_token stopToken, size_t chunkFram
             if (closing.load(std::memory_order_acquire) || !rdpsndContext) {
                 break;
             }
+            sentTimestamps[rdpsndContext->block_no].store(wTimestamp, std::memory_order_release);
             // Prefer SendSamples2 (SNDC_WAVE2) for raw S16LE PCM to send exact samples
             // directly without routing through freerdp_dsp_encode() (which in FreeRDP 3.x
             // corrupts signed 16-bit PCM by flipping the sign bit / offsetting by -32768).
@@ -793,6 +890,7 @@ void AudioStream::Private::runTxLoop(std::stop_token stopToken, size_t chunkFram
             break;
         }
         inFlightBlocks.fetch_add(1, std::memory_order_acq_rel);
+        ++statSent;
     }
 
     qCInfo(KRDP) << "RDPSND audio transmit loop exited (droppedSamples=" << ringBuffer.droppedSamples() << ")";
