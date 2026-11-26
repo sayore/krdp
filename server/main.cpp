@@ -23,6 +23,17 @@
 
 using namespace Qt::StringLiterals;
 
+static std::optional<KRdp::Server::Transport> parseTransport(QAnyStringView value)
+{
+    if (value == u"tcp"_s) {
+        return KRdp::Server::Transport::Tcp;
+    }
+    if (value == u"vsock"_s) {
+        return KRdp::Server::Transport::Vsock;
+    }
+    return std::nullopt;
+}
+
 static std::optional<SessionController::OperationMode> parseOperationMode(QAnyStringView value)
 {
     if (value == u"RemoteAccess"_s) {
@@ -58,6 +69,12 @@ int main(int argc, char **argv)
         {{u"p"_s, u"password"_s}, u"The password to use for login. Requires username to be passed as well."_s, u"password"_s},
         {u"address"_s, u"The address to listen on for connections. Defaults to 0.0.0.0"_s, u"address"_s},
         {u"port"_s, u"The port to use for connections. Defaults to 3389."_s, u"port"_s, u"3389"_s},
+        {u"transport"_s, u"The transport to listen on: tcp (default) or vsock (Hyper-V Enhanced Session AF_VSOCK)."_s, u"transport"_s, u"tcp"_s},
+        {u"vmconnect"_s, u"Enable Hyper-V VMConnect mode (only valid with --transport vsock; enabled by default for vsock)."_s},
+        {u"no-vmconnect"_s, u"Disable Hyper-V VMConnect mode on --transport vsock and require full TLS/NLA."_s},
+        {u"vsock-cid"_s, u"The AF_VSOCK CID to bind to when using --transport vsock (numeric CID or 'any', default: any)."_s, u"cid"_s, u"any"_s},
+        {u"vsock-peer-cid"_s, u"The only AF_VSOCK peer CID permitted to connect (default: 2 / VMADDR_CID_HOST)."_s, u"cid"_s, u"2"_s},
+        {u"pam"_s, u"Enable PAM authentication for the current non-root user."_s},
         {u"certificate"_s, u"The TLS certificate file to use."_s, u"certificate"_s, u"server.crt"_s},
         {u"certificate-key"_s, u"The TLS certificate key to use."_s, u"certificate-key"_s, u"server.key"_s},
         {u"monitor"_s, u"The index of the monitor to use when streaming."_s, u"monitor"_s, u"-1"_s},
@@ -97,6 +114,23 @@ int main(int argc, char **argv)
         }
     };
 
+    const auto transport = parseTransport(parser.value(u"transport"_s).toLower());
+    if (!transport) {
+        qWarning() << "failed to parse transport" << parser.value(u"transport"_s) << ". Expected tcp or vsock";
+        return 1;
+    }
+
+    if (parser.isSet(u"vmconnect"_s) && parser.isSet(u"no-vmconnect"_s)) {
+        qWarning() << "--vmconnect and --no-vmconnect cannot be combined";
+        return 1;
+    }
+
+    const bool hyperVMode = (*transport == KRdp::Server::Transport::Vsock) ? !parser.isSet(u"no-vmconnect"_s) : parser.isSet(u"vmconnect"_s);
+    if (hyperVMode && *transport != KRdp::Server::Transport::Vsock) {
+        qWarning() << "--vmconnect is strictly restricted to --transport vsock and cannot be used with TCP";
+        return 1;
+    }
+
     QHostAddress address = QHostAddress::Any;
     if (parser.isSet(u"address"_s)) {
         address = QHostAddress(parser.value(u"address"_s));
@@ -106,6 +140,30 @@ int main(int argc, char **argv)
     auto certificateKey = std::filesystem::path(parserValueWithDefault(u"certificate-key", config->certificateKey()).toStdString());
 
     KRdp::Server server(nullptr);
+
+    server.setTransport(*transport);
+    server.setHyperVMode(hyperVMode);
+    if (*transport == KRdp::Server::Transport::Vsock) {
+        const QString bindCidStr = parser.value(u"vsock-cid"_s).trimmed().toLower();
+        if (bindCidStr != u"any"_s) {
+            bool ok = false;
+            const quint32 cid = bindCidStr.toUInt(&ok);
+            if (!ok) {
+                qWarning() << "failed to parse --vsock-cid" << bindCidStr << ". Expected numeric CID or 'any'";
+                return 1;
+            }
+            server.setVsockBindCid(cid);
+        }
+
+        const QString peerCidStr = parser.value(u"vsock-peer-cid"_s).trimmed().toLower();
+        bool peerOk = false;
+        const quint32 peerCid = peerCidStr.toUInt(&peerOk);
+        if (!peerOk || peerCid == 0xFFFFFFFFU) {
+            qWarning() << "invalid --vsock-peer-cid" << peerCidStr << ". Expected an explicit numeric CID (default: 2 / VMADDR_CID_HOST)";
+            return 1;
+        }
+        server.setAllowedVsockPeerCid(peerCid);
+    }
 
     server.setAddress(address);
     server.setPort(port);
@@ -119,10 +177,13 @@ int main(int argc, char **argv)
         user.name = parser.value(u"username"_s);
         user.password = parser.value(u"password"_s);
         server.addUser(user);
+        if (parser.isSet(u"pam"_s)) {
+            server.setUsePAMAuthentication(true);
+        }
     }
     // Otherwise use KCM username list
     else {
-        server.setUsePAMAuthentication(config->systemUserEnabled());
+        server.setUsePAMAuthentication(config->systemUserEnabled() || parser.isSet(u"pam"_s));
 
         const auto users = config->users();
         for (const auto &userName : users) {

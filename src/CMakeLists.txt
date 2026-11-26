@@ -62,6 +62,10 @@ target_sources(KRdp PRIVATE ${_dbus_sources})
 
 target_include_directories(KRdp PUBLIC ${FreeRDP_INCLUDE_DIR} ${WinPR_INCLUDE_DIR} ${FreeRDP_Server_INCLUDE_DIR})
 
+if(HAVE_LINUX_VM_SOCKETS_H)
+    target_compile_definitions(KRdp PUBLIC HAVE_LINUX_VM_SOCKETS_H)
+endif()
+
 target_link_libraries(KRdp PUBLIC
     Qt::Core
     Qt::Gui

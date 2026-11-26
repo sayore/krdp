@@ -11,6 +11,7 @@
 
 #include <freerdp/freerdp.h>
 
+#include "Server.h"
 #include "krdp_export.h"
 
 namespace KRdp
@@ -62,6 +63,16 @@ public:
     };
 
     /**
+     * Transport metadata for an accepted connection.
+     */
+    struct TransportInfo {
+        Server::Transport transport = Server::Transport::Tcp;
+        bool vmConnectMode = false;
+        quint32 vsockPeerCid = 0;
+        quint32 vsockPeerPort = 0;
+    };
+
+    /**
      * Constructor.
      *
      * \param server The KRdp::Server instance this session is part of.
@@ -69,7 +80,13 @@ public:
      *                     for communication.
      */
     explicit RdpConnection(Server *server, qintptr socketHandle);
+    explicit RdpConnection(Server *server, qintptr socketHandle, const TransportInfo &transportInfo);
     ~RdpConnection() override;
+
+    /**
+     * Returns whether a username refers to root / UID 0 and must be rejected for RDP login.
+     */
+    static bool isDisallowedLoginUser(const QString &username);
 
     /**
      * The current session state.

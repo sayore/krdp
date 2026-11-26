@@ -1,0 +1,69 @@
+# Maintainer: FOXCORE Integration
+# Builds a side-by-side Arch/CachyOS package installed under /opt/foxcore-krdp
+# so stock pacman-managed KDE Plasma krdp files in /usr are never overwritten.
+
+pkgname=krdp-foxcore
+pkgver=6.8.3
+pkgrel=1
+pkgdesc="KDE KRdp with native AF_VSOCK Hyper-V Enhanced Session support (side-by-side FOXCORE build)"
+arch=('x86_64')
+url="https://invent.kde.org/plasma/krdp"
+license=('LGPL-2.1-only OR LGPL-3.0-only')
+depends=(
+    'freerdp>=2:3.33'
+    'kcmutils'
+    'kconfig'
+    'kcoreaddons'
+    'kcrash'
+    'kguiaddons'
+    'ki18n'
+    'kpipewire'
+    'kstatusnotifieritem'
+    'libei'
+    'libxkbcommon'
+    'pam'
+    'qt6-base'
+    'qt6-declarative'
+    'qtkeychain-qt6'
+    'systemd-libs'
+    'wayland'
+)
+makedepends=(
+    'cmake'
+    'ninja'
+    'extra-cmake-modules'
+    'plasma-wayland-protocols'
+)
+source=('app-org.kde.krdpserver-vsock.service')
+sha256sums=('SKIP')
+
+build() {
+    local src_dir="${FOXCORE_SRC_DIR:-$(cd "${startdir}/../.." && pwd)}"
+    local extra_prefix=()
+    if [[ -n "${FOXCORE_CMAKE_DEPS:-}" && -d "${FOXCORE_CMAKE_DEPS}" ]]; then
+        extra_prefix=("-DCMAKE_PREFIX_PATH=${FOXCORE_CMAKE_DEPS}")
+    fi
+
+    cmake -S "${src_dir}" -B "${srcdir}/build" -G Ninja \
+        -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+        -DCMAKE_INSTALL_PREFIX=/opt/foxcore-krdp \
+        -DKDE_SKIP_RPATH_SETTINGS=ON \
+        -DCMAKE_INSTALL_RPATH='$ORIGIN/../lib:$ORIGIN/../lib64' \
+        -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=FALSE \
+        -DCMAKE_BUILD_WITH_INSTALL_RPATH=FALSE \
+        -DBUILD_TESTING=ON \
+        -DBUILD_EXAMPLES=OFF \
+        "${extra_prefix[@]}"
+
+    cmake --build "${srcdir}/build" -j"$(nproc)"
+}
+
+check() {
+    ctest --test-dir "${srcdir}/build" --output-on-failure
+}
+
+package() {
+    DESTDIR="${pkgdir}" cmake --install "${srcdir}/build"
+    install -Dm644 "${srcdir}/app-org.kde.krdpserver-vsock.service" \
+        "${pkgdir}/opt/foxcore-krdp/share/foxcore/app-org.kde.krdpserver-vsock.service.in"
+}
