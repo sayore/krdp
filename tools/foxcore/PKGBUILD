@@ -1,4 +1,7 @@
-# Maintainer: FOXCORE Integration
+# SPDX-FileCopyrightText: 2026 Amelie Krippner <amykrippner@outlook.de>
+# SPDX-License-Identifier: BSD-2-Clause
+#
+# Maintainer: Amelie Krippner <amykrippner@outlook.de>
 # Builds a side-by-side Arch/CachyOS package installed under /opt/foxcore-krdp
 # so stock pacman-managed KDE Plasma krdp files in /usr are never overwritten.
 

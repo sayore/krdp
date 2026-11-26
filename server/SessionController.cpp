@@ -16,6 +16,7 @@
 #include <QMenu>
 
 #include <KLocalizedString>
+#include <KUser>
 
 #include <PipeWireSourceStream>
 
@@ -214,7 +215,22 @@ void SessionController::onNewConnection(KRdp::RdpConnection *newConnection)
         if ((st != KRdp::RdpConnection::State::Activated && st != KRdp::RdpConnection::State::Streaming) || !safeConnection->isAuthenticated()) {
             return;
         }
+        const QString authedUser = safeConnection->authenticatedUser();
+        const QString sessionOwner = KUser().loginName();
+        const bool requireSessionOwnerMatch =
+            sessionOwner != u"plasmalogin"_s && (safeConnection->authenticatedViaPam() || (m_server->usePAMAuthentication() && m_server->users().isEmpty()));
+        if (requireSessionOwnerMatch && (authedUser.isEmpty() || authedUser != sessionOwner)) {
+            qWarning() << "Refusing to attach Plasma session owned by" << sessionOwner << "for mismatched authenticated user" << authedUser;
+            safeConnection->close(KRdp::RdpConnection::CloseReason::None);
+            return;
+        }
+        if (m_server->hyperVMode() && authedUser.isEmpty()) {
+            qWarning() << "Refusing to attach Hyper-V desktop session without a bound authenticated user identity";
+            safeConnection->close(KRdp::RdpConnection::CloseReason::None);
+            return;
+        }
         *attached = true;
+        qInfo() << "Attaching desktop session for authenticated user" << (authedUser.isEmpty() ? QStringLiteral("<nla>") : authedUser);
 
         auto wrapper = std::make_unique<SessionWrapper>(safeConnection.data(), makeSession(), m_sni);
         if (m_virtualMonitor) {

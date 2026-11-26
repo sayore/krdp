@@ -41,10 +41,16 @@ summary = {
         "af_vsock_host_cid2_accepted": has(r"Accepted AF_VSOCK connection from CID 2"),
         "tls_wrong_version_error_present": has(r"wrong version number"),
         "in_band_greeter_entered": has(r"entering isolated in-band login greeter"),
+        "rdpgfx_caps_confirmed": has(r"Selected encoding mode:"),
+        "greeter_frame_sent": has(r"RDPGFX Progressive frame sent"),
+        "rdpgfx_frame_ack_received": has(r"RDPGFX FrameAcknowledge"),
+        "greeter_input_received": has(r"In-band greeter received (first keyboard|mouse button press|first mouse move)"),
+        "rdpgfx_stall_warning": has(r"RDPGFX frame submission stalled"),
         "root_rejected": has(r"rejected disallowed.*root|Rejecting disallowed RDP login user.*root"),
         "invalid_auth_rejected": has(r"Authentication failed|In-band greeter authentication failed"),
         "guest_authenticated": has(r"PAM authentication succeeded|In-band greeter authenticated guest user|authenticated successfully"),
         "plasma_session_started": has(r"Started Plasma session|Started portal session"),
+        "rdpsnd_audio_activated": has(r"RDPSND audio stream activated"),
     },
 }
 out_path.write_text(json.dumps(summary, indent=2) + "\n")

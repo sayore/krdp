@@ -4,6 +4,7 @@
 #include <QByteArray>
 #include <QDataStream>
 #include <QDir>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QKeyEvent>
 #include <QProcess>
@@ -12,13 +13,18 @@
 #include <QTest>
 #include <QtEndian>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <vector>
 
+#include <freerdp/codec/zgfx.h>
+
+#include "AudioStream.h"
 #include "Clipboard.h"
 #include "InBandGreeter.h"
 #include "RdpConnection.h"
@@ -422,7 +428,7 @@ QByteArray buildConfirmActivePdu(uint32_t shareId, uint16_t userId)
 
     // CAPSTYPE_INPUT (13) - 84 bytes payload
     QByteArray capInp(84, '\0');
-    capInp[0] = 0x01; // INPUT_FLAG_SCANCODES
+    capInp[0] = 0x3D; // INPUT_FLAG_SCANCODES | MOUSEX | FASTPATH_INPUT | UNICODE | FASTPATH_INPUT2
     addCap(0x000D, capInp);
 
     const QByteArray sourceDesc = QByteArray("MSTSC\0", 6);
@@ -446,6 +452,8 @@ struct HandshakeOutcome {
     bool mcsSucceeded = false;
     bool sentClientInfo = false;
     bool sentFinalize = false;
+    uint16_t userId = 0;
+    uint32_t shareId = 0;
 };
 
 /**
@@ -595,8 +603,346 @@ HandshakeOutcome runHyperVWireHandshake(int fd, const QString &username, const Q
         return out;
     }
 
+    out.userId = userId;
+    out.shareId = shareId;
     out.sentFinalize = true;
     return out;
+}
+
+QByteArray recvRdpPdu(int fd, int timeoutMs = 200)
+{
+    char b0 = 0;
+    if (!recvExact(fd, &b0, 1, timeoutMs)) {
+        return {};
+    }
+    const uint8_t first = static_cast<uint8_t>(b0);
+    if (first == 0x03) {
+        char hdr[3] = {};
+        if (!recvExact(fd, hdr, 3, timeoutMs)) {
+            return {};
+        }
+        const uint16_t totalLen = static_cast<uint16_t>((static_cast<uint8_t>(hdr[1]) << 8) | static_cast<uint8_t>(hdr[2]));
+        if (totalLen < 4) {
+            return {};
+        }
+        QByteArray pkt(totalLen, Qt::Uninitialized);
+        pkt[0] = b0;
+        std::memcpy(pkt.data() + 1, hdr, 3);
+        if (totalLen > 4 && !recvExact(fd, pkt.data() + 4, totalLen - 4, timeoutMs)) {
+            return {};
+        }
+        return pkt;
+    }
+
+    // FastPath output PDU
+    char b1 = 0;
+    if (!recvExact(fd, &b1, 1, timeoutMs)) {
+        return {};
+    }
+    uint16_t totalLen = 0;
+    int hdrLen = 2;
+    QByteArray pkt;
+    pkt.append(b0);
+    pkt.append(b1);
+    if (static_cast<uint8_t>(b1) & 0x80) {
+        char b2 = 0;
+        if (!recvExact(fd, &b2, 1, timeoutMs)) {
+            return {};
+        }
+        pkt.append(b2);
+        hdrLen = 3;
+        totalLen = static_cast<uint16_t>(((static_cast<uint8_t>(b1) & 0x7Fu) << 8) | static_cast<uint8_t>(b2));
+    } else {
+        totalLen = static_cast<uint8_t>(b1);
+    }
+    if (totalLen < hdrLen) {
+        return {};
+    }
+    if (totalLen > hdrLen) {
+        const int rem = totalLen - hdrLen;
+        QByteArray tail(rem, Qt::Uninitialized);
+        if (!recvExact(fd, tail.data(), static_cast<size_t>(rem), timeoutMs)) {
+            return {};
+        }
+        pkt.append(tail);
+    }
+    return pkt;
+}
+
+QByteArray wrapStaticVirtualChannelPdu(uint16_t userId, uint16_t channelId, const QByteArray &payload)
+{
+    QByteArray svc;
+    appendU32LE(svc, static_cast<uint32_t>(payload.size()));
+    appendU32LE(svc, 0x00000003u); // CHANNEL_FLAG_FIRST | CHANNEL_FLAG_LAST
+    svc.append(payload);
+    return wrapMcsSendDataRequest(userId, channelId, svc);
+}
+
+void appendDvcChannelId(QByteArray &buf, uint8_t cbId, uint32_t channelId)
+{
+    if (cbId == 0) {
+        appendU8(buf, static_cast<uint8_t>(channelId & 0xFF));
+    } else if (cbId == 1) {
+        appendU16LE(buf, static_cast<uint16_t>(channelId & 0xFFFF));
+    } else {
+        appendU32LE(buf, channelId);
+    }
+}
+
+QByteArray buildRdpGfxCapsAdvertiseDvc(uint16_t userId, uint8_t cbId, uint32_t gfxDvcId)
+{
+    QByteArray gfx;
+    appendU16LE(gfx, 0x0012); // RDPGFX_CMDID_CAPSADVERTISE
+    appendU16LE(gfx, 0);
+    appendU32LE(gfx, 8 + 2 + 12); // pduLength
+    appendU16LE(gfx, 1); // capsSetCount
+    appendU32LE(gfx, 0x000A0701u); // RDPGFX_CAPVERSION_107
+    appendU32LE(gfx, 4); // capsDataLength
+    appendU32LE(gfx, 0x00000080u); // RDPGFX_CAPS_FLAG_SCALEDMAP_DISABLE
+
+    QByteArray dvc;
+    appendU8(dvc, static_cast<uint8_t>((0x03u << 4) | (cbId & 0x03u))); // DYNVC_DATA
+    appendDvcChannelId(dvc, cbId, gfxDvcId);
+    dvc.append(gfx);
+    return wrapStaticVirtualChannelPdu(userId, 1005, dvc);
+}
+
+QByteArray buildRdpGfxFrameAckDvc(uint16_t userId, uint8_t cbId, uint32_t gfxDvcId, uint32_t frameId, uint32_t totalDecoded, uint32_t queueDepth = 0)
+{
+    QByteArray gfx;
+    appendU16LE(gfx, 0x000D); // RDPGFX_CMDID_FRAMEACKNOWLEDGE
+    appendU16LE(gfx, 0);
+    appendU32LE(gfx, 8 + 12);
+    appendU32LE(gfx, queueDepth);
+    appendU32LE(gfx, frameId);
+    appendU32LE(gfx, totalDecoded);
+
+    QByteArray dvc;
+    appendU8(dvc, static_cast<uint8_t>((0x03u << 4) | (cbId & 0x03u))); // DYNVC_DATA
+    appendDvcChannelId(dvc, cbId, gfxDvcId);
+    dvc.append(gfx);
+    return wrapStaticVirtualChannelPdu(userId, 1005, dvc);
+}
+
+QByteArray buildFastPathScancodePdu(uint8_t scancode, bool release, bool extended = false)
+{
+    uint8_t eventFlags = 0;
+    if (release) {
+        eventFlags |= 0x01; // FASTPATH_INPUT_KBDFLAGS_RELEASE
+    }
+    if (extended) {
+        eventFlags |= 0x02; // FASTPATH_INPUT_KBDFLAGS_EXTENDED
+    }
+    QByteArray pdu;
+    appendU8(pdu, 0x04); // action=0 (FastPath), numEvents=1
+    appendU8(pdu, 4); // total length = 4 bytes
+    appendU8(pdu, eventFlags); // eventCode=0 (SCANCODE) | eventFlags
+    appendU8(pdu, scancode);
+    return pdu;
+}
+
+QByteArray buildFastPathMousePdu(uint16_t pointerFlags, uint16_t x, uint16_t y)
+{
+    QByteArray pdu;
+    appendU8(pdu, 0x04); // action=0 (FastPath), numEvents=1
+    appendU8(pdu, 9); // total length = 2 + 1 + 6 = 9 bytes
+    appendU8(pdu, 0x20); // eventCode=1 (MOUSE) << 5
+    appendU16LE(pdu, pointerFlags);
+    appendU16LE(pdu, x);
+    appendU16LE(pdu, y);
+    return pdu;
+}
+
+bool asciiToAtSet1Scancode(char c, uint8_t &scancode, bool &needShift)
+{
+    needShift = false;
+    switch (c) {
+    case 'a':
+    case 'A':
+        scancode = 0x1E;
+        needShift = (c == 'A');
+        return true;
+    case 'b':
+    case 'B':
+        scancode = 0x30;
+        needShift = (c == 'B');
+        return true;
+    case 'c':
+    case 'C':
+        scancode = 0x2E;
+        needShift = (c == 'C');
+        return true;
+    case 'd':
+    case 'D':
+        scancode = 0x20;
+        needShift = (c == 'D');
+        return true;
+    case 'e':
+    case 'E':
+        scancode = 0x12;
+        needShift = (c == 'E');
+        return true;
+    case 'f':
+    case 'F':
+        scancode = 0x21;
+        needShift = (c == 'F');
+        return true;
+    case 'g':
+    case 'G':
+        scancode = 0x22;
+        needShift = (c == 'G');
+        return true;
+    case 'h':
+    case 'H':
+        scancode = 0x23;
+        needShift = (c == 'H');
+        return true;
+    case 'i':
+    case 'I':
+        scancode = 0x17;
+        needShift = (c == 'I');
+        return true;
+    case 'j':
+    case 'J':
+        scancode = 0x24;
+        needShift = (c == 'J');
+        return true;
+    case 'k':
+    case 'K':
+        scancode = 0x25;
+        needShift = (c == 'K');
+        return true;
+    case 'l':
+    case 'L':
+        scancode = 0x26;
+        needShift = (c == 'L');
+        return true;
+    case 'm':
+    case 'M':
+        scancode = 0x32;
+        needShift = (c == 'M');
+        return true;
+    case 'n':
+    case 'N':
+        scancode = 0x31;
+        needShift = (c == 'N');
+        return true;
+    case 'o':
+    case 'O':
+        scancode = 0x18;
+        needShift = (c == 'O');
+        return true;
+    case 'p':
+    case 'P':
+        scancode = 0x19;
+        needShift = (c == 'P');
+        return true;
+    case 'q':
+    case 'Q':
+        scancode = 0x10;
+        needShift = (c == 'Q');
+        return true;
+    case 'r':
+    case 'R':
+        scancode = 0x13;
+        needShift = (c == 'R');
+        return true;
+    case 's':
+    case 'S':
+        scancode = 0x1F;
+        needShift = (c == 'S');
+        return true;
+    case 't':
+    case 'T':
+        scancode = 0x14;
+        needShift = (c == 'T');
+        return true;
+    case 'u':
+    case 'U':
+        scancode = 0x16;
+        needShift = (c == 'U');
+        return true;
+    case 'v':
+    case 'V':
+        scancode = 0x2F;
+        needShift = (c == 'V');
+        return true;
+    case 'w':
+    case 'W':
+        scancode = 0x11;
+        needShift = (c == 'W');
+        return true;
+    case 'x':
+    case 'X':
+        scancode = 0x2D;
+        needShift = (c == 'X');
+        return true;
+    case 'y':
+    case 'Y':
+        scancode = 0x15;
+        needShift = (c == 'Y');
+        return true;
+    case 'z':
+    case 'Z':
+        scancode = 0x2C;
+        needShift = (c == 'Z');
+        return true;
+    case '1':
+    case '!':
+        scancode = 0x02;
+        needShift = (c == '!');
+        return true;
+    case '2':
+        scancode = 0x03;
+        return true;
+    case '3':
+        scancode = 0x04;
+        return true;
+    case '4':
+        scancode = 0x05;
+        return true;
+    case '5':
+        scancode = 0x06;
+        return true;
+    case '6':
+        scancode = 0x07;
+        return true;
+    case '7':
+        scancode = 0x08;
+        return true;
+    case '8':
+        scancode = 0x09;
+        return true;
+    case '9':
+        scancode = 0x0A;
+        return true;
+    case '0':
+        scancode = 0x0B;
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool sendFastPathString(int fd, const QByteArray &ascii)
+{
+    for (const char c : ascii) {
+        uint8_t sc = 0;
+        bool shift = false;
+        if (!asciiToAtSet1Scancode(c, sc, shift)) {
+            return false;
+        }
+        if (shift && !sendAll(fd, buildFastPathScancodePdu(0x2A, false))) {
+            return false;
+        }
+        if (!sendAll(fd, buildFastPathScancodePdu(sc, false)) || !sendAll(fd, buildFastPathScancodePdu(sc, true))) {
+            return false;
+        }
+        if (shift && !sendAll(fd, buildFastPathScancodePdu(0x2A, true))) {
+            return false;
+        }
+    }
+    return true;
 }
 
 } // namespace
@@ -658,6 +1004,7 @@ private Q_SLOTS:
     void testVmConnectRejectsEmptyCredentialsWhenGreeterDisabled()
     {
         auto server = makeTestServer(false);
+        server->setAuthThrottlePolicy(1000, 60000, 100); // soak intentionally sends 50 invalid auth cycles
         QVERIFY(server->start());
 
         int fds[2] = {-1, -1};
@@ -755,6 +1102,7 @@ private Q_SLOTS:
         QTRY_VERIFY_WITH_TIMEOUT(conn.state() == KRdp::RdpConnection::State::Activated || conn.state() == KRdp::RdpConnection::State::Streaming, 3000);
         QVERIFY(conn.isAuthenticated());
         QCOMPARE(conn.authState(), KRdp::RdpConnection::AuthState::Authenticated);
+        QCOMPARE(conn.authenticatedUser(), QStringLiteral("foxguest"));
 
         conn.close();
         ::close(fds[1]);
@@ -781,11 +1129,12 @@ private Q_SLOTS:
         QVERIFY(ho.mcsSucceeded);
         QVERIFY(ho.sentFinalize);
 
-        // Must enter PendingInBandGreeter and MUST NOT be authenticated or initialize Clipboard!
+        // Must enter PendingInBandGreeter and MUST NOT be authenticated or initialize Clipboard/Audio!
         QTRY_COMPARE_WITH_TIMEOUT(conn.authState(), KRdp::RdpConnection::AuthState::PendingInBandGreeter, 3000);
         QVERIFY(!conn.isAuthenticated());
         QCOMPARE(authSpy.count(), 0);
         QVERIFY(!conn.clipboard()->enabled());
+        QVERIFY(!conn.audioStream()->enabled());
 
         // Start greeter directly (simulating RDPGFX open) and verify frame rendering + auth controls
         auto *greeter = conn.inBandGreeter();
@@ -866,6 +1215,270 @@ private Q_SLOTS:
         server->stop();
     }
 
+    void testVmConnectInBandGreeterWireGfxAndInput()
+    {
+        auto server = makeTestServer(true);
+        QVERIFY(server->start());
+
+        int fds[2] = {-1, -1};
+        QCOMPARE(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+
+        KRdp::RdpConnection::TransportInfo info{KRdp::Server::Transport::Vsock, true, true, 2, 50007};
+        KRdp::RdpConnection conn(server.get(), fds[0], info);
+        QSignalSpy authSpy(&conn, &KRdp::RdpConnection::authenticatedChanged);
+
+        QTRY_COMPARE_WITH_TIMEOUT(conn.state(), KRdp::RdpConnection::State::Running, 3000);
+        const HandshakeOutcome ho = runHyperVWireHandshake(fds[1], QString(), QString());
+        QVERIFY(ho.negoSucceeded);
+        QVERIFY(ho.mcsSucceeded);
+        QVERIFY(ho.sentFinalize);
+
+        QTRY_COMPARE_WITH_TIMEOUT(conn.authState(), KRdp::RdpConnection::AuthState::PendingInBandGreeter, 3000);
+        QVERIFY(!conn.isAuthenticated());
+
+        // Drive real drdynvc + RDPGFX wire protocol on fds[1], including Windows VMConnect
+        // double-CapsAdvertise, coalesced FrameAcknowledge, and real FastPath mouse/keyboard input.
+        std::unique_ptr<ZGFX_CONTEXT, decltype(&zgfx_context_free)> zgfx(zgfx_context_new(FALSE), zgfx_context_free);
+        QVERIFY(zgfx != nullptr);
+
+        QByteArray svcReassembly;
+        QByteArray dvcReassembly;
+        uint32_t dvcExpectedLen = 0;
+        bool gfxOpened = false;
+        uint8_t gfxCbId = 0;
+        uint32_t gfxDvcId = 0;
+        std::vector<uint16_t> gfxCmdIds;
+        std::vector<uint32_t> endFrameIds;
+
+        auto readLenField = [](const QByteArray &buf, int &off, uint8_t kind) -> uint32_t {
+            if (kind == 0 && off + 1 <= buf.size()) {
+                return static_cast<uint8_t>(buf[off++]);
+            }
+            if (kind == 1 && off + 2 <= buf.size()) {
+                const uint32_t v = static_cast<uint8_t>(buf[off]) | (static_cast<uint32_t>(static_cast<uint8_t>(buf[off + 1])) << 8);
+                off += 2;
+                return v;
+            }
+            if (kind == 2 && off + 4 <= buf.size()) {
+                const uint32_t v = static_cast<uint8_t>(buf[off]) | (static_cast<uint32_t>(static_cast<uint8_t>(buf[off + 1])) << 8)
+                    | (static_cast<uint32_t>(static_cast<uint8_t>(buf[off + 2])) << 16) | (static_cast<uint32_t>(static_cast<uint8_t>(buf[off + 3])) << 24);
+                off += 4;
+                return v;
+            }
+            return 0;
+        };
+
+        auto parseGfxStream = [&](const QByteArray &compressed) {
+            BYTE *uncomp = nullptr;
+            UINT32 uncompLen = 0;
+            const int rc = zgfx_decompress(zgfx.get(),
+                                           reinterpret_cast<const BYTE *>(compressed.constData()),
+                                           static_cast<UINT32>(compressed.size()),
+                                           &uncomp,
+                                           &uncompLen,
+                                           0);
+            if (rc < 0 || !uncomp || uncompLen < 8) {
+                if (uncomp) {
+                    free(uncomp);
+                }
+                return;
+            }
+            size_t off = 0;
+            while (off + 8 <= uncompLen) {
+                const uint16_t cmdId = static_cast<uint16_t>(uncomp[off] | (uncomp[off + 1] << 8));
+                const uint32_t pduLen = static_cast<uint32_t>(uncomp[off + 4]) | (static_cast<uint32_t>(uncomp[off + 5]) << 8)
+                    | (static_cast<uint32_t>(uncomp[off + 6]) << 16) | (static_cast<uint32_t>(uncomp[off + 7]) << 24);
+                if (pduLen < 8 || off + pduLen > uncompLen) {
+                    break;
+                }
+                gfxCmdIds.push_back(cmdId);
+                if (cmdId == 0x000C && pduLen >= 12) { // RDPGFX_CMDID_ENDFRAME
+                    const uint32_t fid = static_cast<uint32_t>(uncomp[off + 8]) | (static_cast<uint32_t>(uncomp[off + 9]) << 8)
+                        | (static_cast<uint32_t>(uncomp[off + 10]) << 16) | (static_cast<uint32_t>(uncomp[off + 11]) << 24);
+                    endFrameIds.push_back(fid);
+                }
+                off += pduLen;
+            }
+            free(uncomp);
+        };
+
+        auto pumpServerPdus = [&](int durationMs, const std::function<bool()> &stopWhen) {
+            QElapsedTimer timer;
+            timer.start();
+            while (timer.elapsed() < durationMs) {
+                QCoreApplication::processEvents();
+                if (stopWhen && stopWhen()) {
+                    return true;
+                }
+                const QByteArray pkt = recvRdpPdu(fds[1], 40);
+                if (pkt.isEmpty()) {
+                    continue;
+                }
+                if (static_cast<uint8_t>(pkt[0]) != 0x03 || pkt.size() < 16 || static_cast<uint8_t>(pkt[7]) != 0x68) {
+                    continue;
+                }
+                const uint16_t mcsChan = static_cast<uint16_t>((static_cast<uint8_t>(pkt[10]) << 8) | static_cast<uint8_t>(pkt[11]));
+                if (mcsChan != 1005) {
+                    continue;
+                }
+                int off = 13; // 7 (TPKT+X224) + 1 (0x68) + 2 (initiator) + 2 (chan) + 1 (flags)
+                if (off >= pkt.size()) {
+                    continue;
+                }
+                if (static_cast<uint8_t>(pkt[off]) & 0x80) {
+                    off += 2;
+                } else {
+                    off += 1;
+                }
+                if (off + 8 > pkt.size()) {
+                    continue;
+                }
+                const uint32_t svcFlags = static_cast<uint32_t>(static_cast<uint8_t>(pkt[off + 4]))
+                    | (static_cast<uint32_t>(static_cast<uint8_t>(pkt[off + 5])) << 8) | (static_cast<uint32_t>(static_cast<uint8_t>(pkt[off + 6])) << 16)
+                    | (static_cast<uint32_t>(static_cast<uint8_t>(pkt[off + 7])) << 24);
+                const QByteArray chunk = pkt.mid(off + 8);
+                if (svcFlags & 0x01u) {
+                    svcReassembly.clear();
+                }
+                svcReassembly.append(chunk);
+                if (!(svcFlags & 0x02u)) {
+                    continue;
+                }
+
+                const QByteArray dvc = svcReassembly;
+                svcReassembly.clear();
+                if (dvc.isEmpty()) {
+                    continue;
+                }
+                const uint8_t hdr = static_cast<uint8_t>(dvc[0]);
+                const uint8_t cmd = (hdr >> 4) & 0x0Fu;
+                const uint8_t sp = (hdr >> 2) & 0x03u;
+                const uint8_t cbId = hdr & 0x03u;
+                int doff = 1;
+
+                if (cmd == 5) {
+                    // DYNVC_CAPS_VERSION -> reply DYNVC_CAPS_RESPONSE (v2)
+                    QByteArray capsRsp = QByteArray::fromHex("50000200");
+                    sendAll(fds[1], wrapStaticVirtualChannelPdu(ho.userId, 1005, capsRsp));
+                } else if (cmd == 1) {
+                    // DYNVC_CREATE_REQ
+                    const uint32_t chId = readLenField(dvc, doff, cbId);
+                    const QByteArray chName = dvc.mid(doff).split('\0').first();
+                    QByteArray createRsp;
+                    appendU8(createRsp, static_cast<uint8_t>((1u << 4) | cbId));
+                    appendDvcChannelId(createRsp, cbId, chId);
+                    appendU32LE(createRsp, 0); // STATUS_SUCCESS
+                    sendAll(fds[1], wrapStaticVirtualChannelPdu(ho.userId, 1005, createRsp));
+                    if (chName == "Microsoft::Windows::RDS::Graphics") {
+                        gfxOpened = true;
+                        gfxCbId = cbId;
+                        gfxDvcId = chId;
+                    }
+                } else if (cmd == 2 || cmd == 3) {
+                    const uint32_t chId = readLenField(dvc, doff, cbId);
+                    if (!gfxOpened || chId != gfxDvcId) {
+                        continue;
+                    }
+                    if (cmd == 2) {
+                        dvcExpectedLen = readLenField(dvc, doff, sp);
+                        dvcReassembly = dvc.mid(doff);
+                    } else if (dvcExpectedLen > 0) {
+                        dvcReassembly.append(dvc.mid(doff));
+                    } else {
+                        parseGfxStream(dvc.mid(doff));
+                        continue;
+                    }
+                    if (dvcExpectedLen > 0 && static_cast<uint32_t>(dvcReassembly.size()) >= dvcExpectedLen) {
+                        parseGfxStream(dvcReassembly.left(static_cast<int>(dvcExpectedLen)));
+                        dvcReassembly.clear();
+                        dvcExpectedLen = 0;
+                    }
+                }
+            }
+            return stopWhen ? stopWhen() : true;
+        };
+
+        // 1. Wait for drdynvc + Microsoft::Windows::RDS::Graphics channel creation
+        QVERIFY(pumpServerPdus(4000, [&]() {
+            return gfxOpened;
+        }));
+
+        // 2. Send CapsAdvertise #1 -> verify CapsConfirm + Frame 1 (frameId starts at 1, not 0!)
+        QVERIFY(sendAll(fds[1], buildRdpGfxCapsAdvertiseDvc(ho.userId, gfxCbId, gfxDvcId)));
+        QVERIFY(pumpServerPdus(4000, [&]() {
+            return !endFrameIds.empty();
+        }));
+        QCOMPARE(endFrameIds.front(), 1u);
+        QVERIFY(std::find(gfxCmdIds.begin(), gfxCmdIds.end(), 0x0013u /* CAPSCONFIRM */) != gfxCmdIds.end());
+        QVERIFY(std::find(gfxCmdIds.begin(), gfxCmdIds.end(), 0x0002u /* WIRETOSURFACE_2 */) != gfxCmdIds.end());
+
+        // 3. Simulate Windows VMConnect double-CapsAdvertise (#2) right after Frame 1!
+        const size_t cmdsBeforeReAdv = gfxCmdIds.size();
+        const size_t framesBeforeReAdv = endFrameIds.size();
+        QVERIFY(sendAll(fds[1], buildRdpGfxCapsAdvertiseDvc(ho.userId, gfxCbId, gfxDvcId)));
+        QVERIFY(pumpServerPdus(4000, [&]() {
+            return endFrameIds.size() > framesBeforeReAdv;
+        }));
+
+        // Verify NO DeleteEncodingContext (0x0003) or DeleteSurface (0x000A) was sent BEFORE CapsConfirm #2!
+        bool sawCapsConfirm2 = false;
+        for (size_t i = cmdsBeforeReAdv; i < gfxCmdIds.size(); ++i) {
+            if (gfxCmdIds[i] == 0x0013u) {
+                sawCapsConfirm2 = true;
+                break;
+            }
+            QVERIFY2(gfxCmdIds[i] != 0x0003u && gfxCmdIds[i] != 0x000Au,
+                     "DeleteEncodingContext/DeleteSurface must not be sent before CapsConfirm on re-advertisement");
+        }
+        QVERIFY(sawCapsConfirm2);
+
+        // 4. Test coalesced FrameAcknowledge + real wire FastPath Mouse & Keyboard input!
+        // Trigger 2 focus-change redraws by clicking Username field (640, 332) then Password field (640, 404),
+        // acknowledge ONLY the latest frameId, and verify subsequent frames still flow without stalling.
+        const size_t framesBeforeClicks = endFrameIds.size();
+        QVERIFY(sendAll(fds[1], buildFastPathMousePdu(0x9000 /* DOWN|BUTTON1 */, 640, 332)));
+        QVERIFY(sendAll(fds[1], buildFastPathMousePdu(0x1000 /* BUTTON1 up */, 640, 332)));
+        QVERIFY(pumpServerPdus(3000, [&]() {
+            return endFrameIds.size() > framesBeforeClicks;
+        }));
+        const uint32_t latestBeforeAck = endFrameIds.back();
+        // Coalesced ACK: only acknowledge latest frameId (must clear all older pending frames too!)
+        QVERIFY(sendAll(fds[1], buildRdpGfxFrameAckDvc(ho.userId, gfxCbId, gfxDvcId, latestBeforeAck, latestBeforeAck)));
+
+        // Clear prefilled username via Backspace scancodes (0x0E), type "foxguest", Tab (0x0F),
+        // type "ValidGuestPass!99", press Return (0x1C) — 100% over real FastPath wire PDUs!
+        for (int i = 0; i < 16; ++i) {
+            QVERIFY(sendAll(fds[1], buildFastPathScancodePdu(0x0E, false)));
+            QVERIFY(sendAll(fds[1], buildFastPathScancodePdu(0x0E, true)));
+        }
+        QVERIFY(sendFastPathString(fds[1], QByteArrayLiteral("foxguest")));
+        QVERIFY(sendAll(fds[1], buildFastPathScancodePdu(0x0F, false))); // Tab -> Password
+        QVERIFY(sendAll(fds[1], buildFastPathScancodePdu(0x0F, true)));
+        // Acknowledge frames generated while typing username so window stays open
+        pumpServerPdus(200, nullptr);
+        if (!endFrameIds.empty()) {
+            QVERIFY(sendAll(fds[1], buildRdpGfxFrameAckDvc(ho.userId, gfxCbId, gfxDvcId, endFrameIds.back(), endFrameIds.back())));
+        }
+
+        QVERIFY(sendFastPathString(fds[1], QByteArrayLiteral("ValidGuestPass!99")));
+        QVERIFY(sendAll(fds[1], buildFastPathScancodePdu(0x1C, false))); // Return -> Submit
+        QVERIFY(sendAll(fds[1], buildFastPathScancodePdu(0x1C, true)));
+
+        QVERIFY(pumpServerPdus(4000, [&]() {
+            return conn.isAuthenticated();
+        }));
+        QVERIFY(conn.isAuthenticated());
+        QCOMPARE(conn.authState(), KRdp::RdpConnection::AuthState::Authenticated);
+        QCOMPARE(conn.authenticatedUser(), QStringLiteral("foxguest"));
+        QCOMPARE(authSpy.count(), 1);
+        QVERIFY(!conn.inBandGreeter()->isActive());
+
+        conn.close();
+        ::close(fds[1]);
+        QTRY_COMPARE_WITH_TIMEOUT(conn.state(), KRdp::RdpConnection::State::Closed, 3000);
+        server->stop();
+    }
+
     void testVmConnect100CycleSoakNoLeak()
     {
         auto readProcStatusValue = [](const QByteArray &prefix) -> qint64 {
@@ -895,6 +1508,7 @@ private Q_SLOTS:
         };
 
         auto server = makeTestServer(false);
+        server->setAuthThrottlePolicy(1000, 60000, 100); // soak intentionally sends 50 invalid auth cycles
         QVERIFY(server->start());
 
         qint64 rssWarmKb = -1;
@@ -950,6 +1564,76 @@ private Q_SLOTS:
         QVERIFY2(fdsEnd - fdsWarm <= 2, qPrintable(QStringLiteral("FD leak detected: warm=%1 end=%2").arg(fdsWarm).arg(fdsEnd)));
         QVERIFY2(threadsEnd <= threadsWarm + 1, qPrintable(QStringLiteral("Thread leak detected: warm=%1 end=%2").arg(threadsWarm).arg(threadsEnd)));
         QVERIFY2(rssGrowthMib < 16.0, qPrintable(QStringLiteral("Excessive RSS growth over 90 cycles: %1 MiB").arg(rssGrowthMib)));
+
+        server->stop();
+    }
+
+    void testCrossConnectionAuthThrottlingAndUserBinding()
+    {
+        auto server = makeTestServer(true);
+        // Lock out user after 3 failures across separate connections for 350 ms
+        server->setAuthThrottlePolicy(3, 10000, 350);
+        QVERIFY(server->start());
+
+        // 3 separate connections each failing once as "foxguest" -> triggers cross-connection lockout
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            int fds[2] = {-1, -1};
+            QCOMPARE(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+            KRdp::RdpConnection::TransportInfo info{KRdp::Server::Transport::Vsock, true, true, 2, static_cast<quint32>(52000 + attempt)};
+            KRdp::RdpConnection conn(server.get(), fds[0], info);
+            QTRY_COMPARE_WITH_TIMEOUT(conn.state(), KRdp::RdpConnection::State::Running, 2000);
+            const HandshakeOutcome ho = runHyperVWireHandshake(fds[1], QStringLiteral("foxguest"), QStringLiteral("WrongPass"));
+            QVERIFY(ho.sentFinalize);
+            QTRY_COMPARE_WITH_TIMEOUT(conn.state(), KRdp::RdpConnection::State::Closed, 2000);
+            QVERIFY(!conn.isAuthenticated());
+            QVERIFY(conn.authenticatedUser().isEmpty());
+            ::close(fds[1]);
+        }
+
+        // 4th connection with VALID password must still be rejected while lockout is active!
+        QVERIFY(!server->isAuthAttemptAllowed(QStringLiteral("foxguest")));
+        {
+            int fds[2] = {-1, -1};
+            QCOMPARE(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+            KRdp::RdpConnection::TransportInfo info{KRdp::Server::Transport::Vsock, true, true, 2, 52010};
+            KRdp::RdpConnection conn(server.get(), fds[0], info);
+            QTRY_COMPARE_WITH_TIMEOUT(conn.state(), KRdp::RdpConnection::State::Running, 2000);
+            const HandshakeOutcome ho = runHyperVWireHandshake(fds[1], QStringLiteral("foxguest"), QStringLiteral("ValidGuestPass!99"));
+            QVERIFY(ho.sentFinalize);
+            QTRY_COMPARE_WITH_TIMEOUT(conn.state(), KRdp::RdpConnection::State::Closed, 2000);
+            QVERIFY(!conn.isAuthenticated());
+            QVERIFY(conn.authenticatedUser().isEmpty());
+            ::close(fds[1]);
+        }
+
+        // After lockout window expires, valid login succeeds and binds authenticatedUser()
+        QTest::qWait(400);
+        QVERIFY(server->isAuthAttemptAllowed(QStringLiteral("foxguest")));
+
+        // Verify bogus/disallowed username flooding does NOT lock out legitimate user "foxguest"
+        // and keeps tracked auth throttle maps strictly bounded (no memory DoS).
+        for (int i = 0; i < 600; ++i) {
+            server->recordAuthFailure(QStringLiteral("bogus_user_%1").arg(i));
+        }
+        QVERIFY2(server->trackedAuthThrottleEntries() <= 512,
+                 qPrintable(QStringLiteral("Unbounded auth throttle map: %1 entries").arg(server->trackedAuthThrottleEntries())));
+        QVERIFY(server->isAuthAttemptAllowed(QStringLiteral("foxguest")));
+
+        {
+            int fds[2] = {-1, -1};
+            QCOMPARE(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+            KRdp::RdpConnection::TransportInfo info{KRdp::Server::Transport::Vsock, true, true, 2, 52011};
+            KRdp::RdpConnection conn(server.get(), fds[0], info);
+            QTRY_COMPARE_WITH_TIMEOUT(conn.state(), KRdp::RdpConnection::State::Running, 2000);
+            const HandshakeOutcome ho = runHyperVWireHandshake(fds[1], QStringLiteral("FOXCORE\\foxguest"), QStringLiteral("ValidGuestPass!99"));
+            QVERIFY(ho.sentFinalize);
+            QTRY_VERIFY_WITH_TIMEOUT(conn.isAuthenticated(), 2000);
+            QCOMPARE(conn.authenticatedUser(), QStringLiteral("foxguest"));
+            QVERIFY(!conn.authenticatedViaPam());
+            conn.close();
+            ::close(fds[1]);
+            QTRY_COMPARE_WITH_TIMEOUT(conn.state(), KRdp::RdpConnection::State::Closed, 2000);
+        }
 
         server->stop();
     }

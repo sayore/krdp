@@ -146,6 +146,18 @@ public:
     void setUsePAMAuthentication(bool usePAM);
 
     /**
+     * Cross-connection authentication rate limiting policy.
+     *
+     * Tracks failed authentication attempts across connections within a rolling
+     * window and temporarily locks out excessive failures per user or globally.
+     */
+    void setAuthThrottlePolicy(int maxFailuresPerUser, int windowMs, int lockoutMs);
+    bool isAuthAttemptAllowed(const QString &username) const;
+    void recordAuthFailure(const QString &username);
+    void recordAuthSuccess(const QString &username);
+    qsizetype trackedAuthThrottleEntries() const;
+
+    /**
      * The path of a certificate file to use for encrypting communications.
      *
      * This is required to be set to a valid file, as the RDP login process only
