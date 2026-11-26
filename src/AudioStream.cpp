@@ -177,6 +177,22 @@ size_t AudioStream::PcmRingBuffer::read(int16_t *dst, size_t count)
     return toRead;
 }
 
+size_t AudioStream::PcmRingBuffer::discard(size_t count)
+{
+    if (count == 0 || m_capacity == 0) {
+        return 0;
+    }
+    const size_t r = m_readPos.load(std::memory_order_relaxed);
+    const size_t w = m_writePos.load(std::memory_order_acquire);
+    const size_t avail = w - r;
+    const size_t toDiscard = std::min(count, avail);
+    if (toDiscard > 0) {
+        m_readPos.store(r + toDiscard, std::memory_order_release);
+        m_droppedSamples.fetch_add(static_cast<uint64_t>(toDiscard), std::memory_order_relaxed);
+    }
+    return toDiscard;
+}
+
 class KRDP_NO_EXPORT AudioStream::Private
 {
 public:
@@ -360,7 +376,7 @@ bool AudioStream::initialize(bool useDynamicChannel)
     ctx->server_formats = d->serverFormats.data();
     ctx->num_server_formats = d->serverFormats.size();
     ctx->src_format = &d->srcFormat;
-    ctx->latency = 50;
+    ctx->latency = 20;
     ctx->Activated = Private::activatedCallback;
     ctx->ConfirmBlock = Private::confirmBlockCallback;
     ctx->ChannelIdAssigned = Private::channelIdAssignedCallback;
@@ -509,10 +525,10 @@ bool AudioStream::Private::startPipeWireCaptureLocked(uint32_t sampleRate, uint1
         pw_init(nullptr, nullptr);
     });
 
-    framesPerChunk = std::max<size_t>(160, sampleRate / 50); // ~20 ms per RDPSND packet
+    framesPerChunk = std::max<size_t>(160, sampleRate / 100); // ~10 ms low-latency RDPSND packet
     samplesPerChunk = framesPerChunk * channels;
-    // Bounded ring buffer (~240 ms minimum, rounded to power-of-two) allocated ONCE before RT thread starts.
-    ringBuffer.configure(samplesPerChunk * 12);
+    // Bounded low-latency ring buffer (~80 ms minimum, rounded to power-of-two) allocated ONCE before RT thread starts.
+    ringBuffer.configure(samplesPerChunk * 8);
 
     if (wakeEventFd < 0) {
         wakeEventFd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
@@ -542,6 +558,8 @@ bool AudioStream::Private::startPipeWireCaptureLocked(uint32_t sampleRate, uint1
 
     char latencySpec[64] = {};
     std::snprintf(latencySpec, sizeof(latencySpec), "%zu/%u", framesPerChunk, sampleRate);
+    char maxLatencySpec[64] = {};
+    std::snprintf(maxLatencySpec, sizeof(maxLatencySpec), "%zu/%u", framesPerChunk * 2, sampleRate);
 
     pw_thread_loop_lock(pwLoop);
 
@@ -565,6 +583,8 @@ bool AudioStream::Private::startPipeWireCaptureLocked(uint32_t sampleRate, uint1
                                              "2000",
                                              PW_KEY_NODE_LATENCY,
                                              latencySpec,
+                                             PW_KEY_NODE_MAX_LATENCY,
+                                             maxLatencySpec,
                                              "monitor.channel-volumes",
                                              "true",
                                              nullptr);
@@ -685,28 +705,36 @@ void AudioStream::Private::onActivated(RdpsndServerContext *context)
 void AudioStream::Private::runTxLoop(std::stop_token stopToken, size_t chunkFrames, size_t chunkSamples)
 {
     const auto startTime = std::chrono::steady_clock::now();
-    constexpr int SilenceTailChunks = 25; // 500 ms tail after sound stops
-    constexpr int MaxInFlightBlocks = 16; // ~320 ms buffer ceiling
+    constexpr int SilenceTailChunks = 40; // 400 ms tail at 10 ms/chunk
+    constexpr int MaxInFlightBlocks = 5; // ~50 ms in-flight latency cap
+    constexpr size_t MaxBufferedChunksBeforeTrim = 4; // trim stale backlog above ~40 ms
     int silentChunksRemaining = 0;
 
     std::vector<int16_t> chunk(chunkSamples);
 
     while (!stopToken.stop_requested() && !closing.load(std::memory_order_acquire)) {
-        if (ringBuffer.available() < chunkSamples) {
+        const size_t avail = ringBuffer.available();
+        if (avail < chunkSamples) {
             if (wakeEventFd >= 0) {
                 pollfd pfd{};
                 pfd.fd = wakeEventFd;
                 pfd.events = POLLIN;
-                const int rc = ::poll(&pfd, 1, 25);
+                const int rc = ::poll(&pfd, 1, 10);
                 if (rc > 0 && (pfd.revents & POLLIN)) {
                     uint64_t drained = 0;
                     const ssize_t ignored = ::read(wakeEventFd, &drained, sizeof(drained));
                     (void)ignored;
                 }
             } else {
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
             }
             continue;
+        }
+
+        // Prevent permanent audio lag after transient spikes by trimming stale backlog down to ~20 ms.
+        if (avail > chunkSamples * MaxBufferedChunksBeforeTrim) {
+            const size_t targetKeep = chunkSamples * 2;
+            ringBuffer.discard(avail - targetKeep);
         }
 
         const size_t got = ringBuffer.read(chunk.data(), chunkSamples);
@@ -729,7 +757,7 @@ void AudioStream::Private::runTxLoop(std::stop_token stopToken, size_t chunkFram
 
         if (inFlightBlocks.load(std::memory_order_acquire) >= MaxInFlightBlocks) {
             const uint64_t lastConf = lastConfirmSteadyMs.load(std::memory_order_acquire);
-            if (lastConf != 0 && (nowMs - lastConf) > 600) {
+            if (lastConf != 0 && (nowMs - lastConf) > 250) {
                 inFlightBlocks.store(0, std::memory_order_release);
             } else {
                 continue;

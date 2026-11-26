@@ -134,6 +134,14 @@ private Q_SLOTS:
             QCOMPARE(out[i], static_cast<int16_t>(i & 0x7FFF));
         }
 
+        // Discard helper for stale-backlog trimming
+        QCOMPARE(ring.write(block.data(), 500), size_t(500));
+        QCOMPARE(ring.discard(300), size_t(300));
+        QCOMPARE(ring.available(), size_t(200));
+        std::vector<int16_t> tail(200);
+        QCOMPARE(ring.read(tail.data(), tail.size()), size_t(200));
+        QCOMPARE(tail[0], static_cast<int16_t>(300));
+
         // 2. Concurrent SPSC lock-free thread-safety stress test (100,000 samples across 2 threads)
         ring.configure(4096);
         constexpr size_t TotalSamples = 100'000;
