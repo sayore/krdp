@@ -148,19 +148,21 @@ public:
     using ProgressiveContextPtr = std::unique_ptr<PROGRESSIVE_CONTEXT, decltype(&progressive_context_free)>;
 
     RdpConnection *session;
-    std::optional<EncodingMode> activeEncodingMode;
+    std::atomic<int> activeEncodingMode{-1};
     EncodingMode negotiatedDesktopMode = EncodingMode::Progressive;
     std::unique_ptr<VideoStreamSurface> surface;
 
     RdpGfxContextPtr gfxContext = RdpGfxContextPtr(nullptr, rdpgfx_server_context_free);
     ProgressiveContextPtr progressive = ProgressiveContextPtr(nullptr, progressive_context_free);
+    std::mutex gfxMutex;
 
-    uint32_t frameId = 0;
+    uint32_t frameId = 1;
     uint32_t channelId = 0;
     uint16_t nextSurfaceId = 1;
-    bool enabled = false;
+    std::atomic<bool> enabled{false};
     bool streamingEnabled = false;
-    bool capsConfirmed = false;
+    std::atomic<bool> capsConfirmed{false};
+    std::atomic<bool> closing{false};
     bool channelOpen = false;
 
     std::jthread frameSubmissionThread;
@@ -169,6 +171,11 @@ public:
     QSet<uint32_t> pendingFrames;
     bool frameAcknowledgementSuspended = false;
     std::mutex pendingFramesMutex;
+
+    uint64_t framesSent = 0;
+    uint64_t acksReceived = 0;
+    clk::steady_clock::time_point inFlightBlockedSince{};
+    bool stallWarningLogged = false;
 
     std::atomic_int requestedFrameRate = 60;
     std::atomic<qsizetype> maxInFlight{MaximumInFlightFrames}; // recomputed from RTT on rttChanged
@@ -184,6 +191,7 @@ public:
     bool hasBaseRtt = false;
 
     bool initialized = false;
+    bool awaitingH264KeyFrame = false;
     quint8 quality = 100;
     quint8 qualityCap = 100;
     bool adaptiveQuality = true;
@@ -254,9 +262,19 @@ VideoStream::VideoStream(RdpConnection *session)
     d->surface = std::make_unique<VideoStreamSurface>(this);
 }
 
-void VideoStream::setActiveEncodingMode(EncodingMode mode)
+std::optional<VideoStream::EncodingMode> VideoStream::activeEncodingMode() const
 {
-    if (d->activeEncodingMode == mode) {
+    const int raw = d->activeEncodingMode.load(std::memory_order_acquire);
+    if (raw < 0) {
+        return std::nullopt;
+    }
+    return static_cast<EncodingMode>(raw);
+}
+
+void VideoStream::setActiveEncodingMode(EncodingMode mode, bool forceSurfaceInit)
+{
+    const auto current = activeEncodingMode();
+    if (!forceSurfaceInit && current == mode) {
         return;
     }
 
@@ -264,8 +282,10 @@ void VideoStream::setActiveEncodingMode(EncodingMode mode)
         std::lock_guard lock(d->frameQueueMutex);
         d->frameQueue.clear();
     }
-    d->surface->setActiveEncodingMode(mode, d->quality, d->requestedFrameRate.load());
-    d->activeEncodingMode = mode;
+    if (d->session->isAuthenticated()) {
+        d->surface->setActiveEncodingMode(mode, d->quality, d->requestedFrameRate.load());
+    }
+    d->activeEncodingMode.store(static_cast<int>(mode), std::memory_order_release);
 }
 
 void VideoStream::setSize(const QSize &newSize)
@@ -335,6 +355,7 @@ bool VideoStream::initialize()
         }
     }
 
+    d->closing.store(false, std::memory_order_release);
     d->initialized = true;
 
     connect(d->session->networkDetection(), &NetworkDetection::rttChanged, this, &VideoStream::updateInFlightWindow);
@@ -342,10 +363,44 @@ bool VideoStream::initialize()
 
     d->frameSubmissionThread = std::jthread([this](std::stop_token token) {
         while (!token.stop_requested()) {
-            if (!hasInFlightCapacity() || !d->gfxContext || !d->capsConfirmed) {
+            const bool capsReady = d->capsConfirmed.load(std::memory_order_acquire);
+            if (!d->gfxContext || !capsReady) {
+                d->inFlightBlockedSince = {};
+                d->stallWarningLogged = false;
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 continue;
             }
+
+            if (!hasInFlightCapacity()) {
+                bool hasQueued = false;
+                {
+                    std::lock_guard lock(d->frameQueueMutex);
+                    hasQueued = !d->frameQueue.isEmpty();
+                }
+                if (hasQueued) {
+                    const auto now = clk::steady_clock::now();
+                    if (d->inFlightBlockedSince == clk::steady_clock::time_point{}) {
+                        d->inFlightBlockedSince = now;
+                    } else if (!d->stallWarningLogged && (now - d->inFlightBlockedSince) >= clk::milliseconds(2000)) {
+                        d->stallWarningLogged = true;
+                        QList<uint32_t> pendingList;
+                        bool ackSuspended = false;
+                        {
+                            std::lock_guard lock(d->pendingFramesMutex);
+                            pendingList = d->pendingFrames.values();
+                            ackSuspended = d->frameAcknowledgementSuspended;
+                        }
+                        std::sort(pendingList.begin(), pendingList.end());
+                        qCWarning(KRDP) << "RDPGFX frame submission stalled for >2s waiting for FrameAcknowledge:"
+                                        << "pendingCount=" << pendingList.size() << "pendingIds=" << pendingList << "maxInFlight=" << d->maxInFlight.load()
+                                        << "ackSuspended=" << ackSuspended << "framesSent=" << d->framesSent << "acksReceived=" << d->acksReceived;
+                    }
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                continue;
+            }
+            d->inFlightBlockedSince = {};
+            d->stallWarningLogged = false;
 
             VideoFrame nextFrame;
             {
@@ -362,13 +417,16 @@ bool VideoStream::initialize()
         }
     });
 
-    qCDebug(KRDP) << "Video stream initialized with H.264" << (h264Disabled() ? "disabled" : "enabled");
+    qCInfo(KRDP) << "Video stream initialized with H.264" << (h264Disabled() ? "disabled" : "enabled");
 
     return true;
 }
 
 void VideoStream::close()
 {
+    d->closing.store(true, std::memory_order_release);
+    d->capsConfirmed.store(false, std::memory_order_release);
+
     if (d->surface->encodedStream) {
         d->surface->encodedStream->stop();
     }
@@ -380,26 +438,27 @@ void VideoStream::close()
         d->frameSubmissionThread.join();
     }
 
-    {
-        std::lock_guard lock(d->pendingFramesMutex);
-        d->pendingFrames.clear();
-        d->frameAcknowledgementSuspended = false;
-    }
-    {
-        std::lock_guard lock(d->frameQueueMutex);
-        d->frameQueue.clear();
+    if (d->gfxContext && d->channelOpen) {
+        d->gfxContext->Close(d->gfxContext.get());
+        d->channelOpen = false;
     }
 
-    destroySurface();
-
-    if (d->gfxContext) {
-        if (d->channelOpen) {
-            d->gfxContext->Close(d->gfxContext.get());
-            d->channelOpen = false;
+    {
+        std::lock_guard gfxLock(d->gfxMutex);
+        {
+            std::lock_guard lock(d->pendingFramesMutex);
+            d->pendingFrames.clear();
+            d->frameAcknowledgementSuspended = false;
         }
+        {
+            std::lock_guard lock(d->frameQueueMutex);
+            d->frameQueue.clear();
+        }
+
+        resetLocalSurfaceState();
         d->gfxContext.reset();
     }
-    d->activeEncodingMode.reset();
+    d->activeEncodingMode.store(-1, std::memory_order_release);
     d->initialized = false;
 
     Q_EMIT closed();
@@ -407,18 +466,19 @@ void VideoStream::close()
 
 void VideoStream::queueFrame(const KRdp::VideoFrame &frame)
 {
-    if (d->session->state() != RdpConnection::State::Streaming || !d->enabled) {
+    if (d->session->state() != RdpConnection::State::Streaming || !d->enabled.load(std::memory_order_acquire)) {
         return;
     }
     d->producedFrames.fetch_add(1, std::memory_order_relaxed);
 
-    if (d->activeEncodingMode == EncodingMode::H264) {
+    const auto mode = activeEncodingMode();
+    if (mode == EncodingMode::H264) {
         std::lock_guard lock(d->frameQueueMutex);
         if (frame.isKeyFrame) {
             d->frameQueue.clear();
         }
         d->frameQueue.append(frame);
-    } else if (d->activeEncodingMode == EncodingMode::Progressive) {
+    } else if (mode == EncodingMode::Progressive) {
         std::lock_guard lock(d->frameQueueMutex);
         // for the raster path we only need to keep the latest frame, but accumulate damage
         QRegion lastDamage;
@@ -435,21 +495,20 @@ void VideoStream::queueFrame(const KRdp::VideoFrame &frame)
 
 void VideoStream::reset()
 {
-    d->surface->pendingReset = true;
+    d->surface->pendingReset.store(true, std::memory_order_release);
 }
 
 bool VideoStream::enabled() const
 {
-    return d->enabled;
+    return d->enabled.load(std::memory_order_acquire);
 }
 
 void VideoStream::setEnabled(bool enabled)
 {
-    if (d->enabled == enabled) {
+    if (d->enabled.exchange(enabled, std::memory_order_acq_rel) == enabled) {
         return;
     }
 
-    d->enabled = enabled;
     Q_EMIT enabledChanged();
 }
 
@@ -489,7 +548,7 @@ void VideoStream::setAdaptiveQuality(bool enabled)
 
 void VideoStream::seedQuality(quint8 quality)
 {
-    if (!d->adaptiveQuality || d->activeEncodingMode != EncodingMode::H264) {
+    if (!d->adaptiveQuality || activeEncodingMode() != EncodingMode::H264) {
         return;
     }
     const quint8 hi = std::max<quint8>(d->qualityCap, quint8(MinAdaptiveQuality));
@@ -499,7 +558,20 @@ void VideoStream::seedQuality(quint8 quality)
 
 void VideoStream::setRequestedSize(const QSize &size)
 {
+    if (size.isEmpty()) {
+        return;
+    }
+    const bool sizeChanged = (d->surface->requestedSize != size);
+    if (sizeChanged) {
+        // Restore target quality and pause adaptive down-scaling across encoder
+        // restarts so dynamic window resizes do not degrade stream sharpness.
+        d->lastQualityUpdate = clk::system_clock::now();
+        d->quality = d->qualityCap;
+    }
     d->surface->setRequestedSize(size);
+    if (sizeChanged) {
+        applyQuality();
+    }
 }
 
 void VideoStream::setPipeWireSource(quint32 nodeId, quint64 objectSerial, int fd)
@@ -512,31 +584,40 @@ void VideoStream::onSessionAuthenticated()
     if (!d->initialized) {
         return;
     }
-    d->surface->pendingReset = true;
-    setActiveEncodingMode(d->negotiatedDesktopMode);
+    qCInfo(KRDP) << "VideoStream switching to authenticated desktop mode:" << encodingModeName(d->negotiatedDesktopMode);
+    d->surface->pendingReset.store(true, std::memory_order_release);
+    setActiveEncodingMode(d->negotiatedDesktopMode, true);
 }
 
 bool VideoStream::onChannelIdAssigned(uint32_t channelId)
 {
     d->channelId = channelId;
+    qCInfo(KRDP) << "RDPGFX channel id assigned:" << channelId;
 
     return true;
 }
 
 uint32_t VideoStream::onCapsAdvertise(const RDPGFX_CAPS_ADVERTISE_PDU *capsAdvertise)
 {
-    // Windows clients (mstsc) send CapsAdvertise twice: once during
-    // initial setup and again after confirming. If we already confirmed
-    // caps, this is a GFX channel reset — clear surface state so
-    // surfaces get re-created on the next frame.
-    if (d->capsConfirmed) {
-        qCDebug(KRDP) << "GFX channel reset (re-advertisement), resetting surface state";
-        d->capsConfirmed = false;
-        d->surface->pendingReset = true;
-        destroySurface();
-        std::lock_guard lock(d->pendingFramesMutex);
-        d->pendingFrames.clear();
-        d->frameAcknowledgementSuspended = false;
+    if (d->closing.load(std::memory_order_acquire)) {
+        return CHANNEL_RC_OK;
+    }
+
+    // Windows clients (mstsc / vmconnect) send CapsAdvertise twice: once during
+    // initial setup and again after confirming. Serialize with frameSubmissionThread
+    // via gfxMutex and reset local surface tracking WITHOUT sending DeleteSurface
+    // before CapsConfirm (which violates MS-RDPEGFX re-negotiation ordering).
+    bool isReAdvertise = false;
+    {
+        std::lock_guard gfxLock(d->gfxMutex);
+        if (d->capsConfirmed.exchange(false, std::memory_order_acq_rel)) {
+            isReAdvertise = true;
+            d->surface->pendingReset.store(true, std::memory_order_release);
+            resetLocalSurfaceState();
+            std::lock_guard lock(d->pendingFramesMutex);
+            d->pendingFrames.clear();
+            d->frameAcknowledgementSuspended = false;
+        }
     }
 
     auto capsSets = capsAdvertise->capsSets;
@@ -545,7 +626,7 @@ uint32_t VideoStream::onCapsAdvertise(const RDPGFX_CAPS_ADVERTISE_PDU *capsAdver
     std::vector<RdpCapsInformation> capsInformation;
     capsInformation.reserve(count);
 
-    qCDebug(KRDP) << "Received caps:";
+    qCInfo(KRDP) << "RDPGFX CapsAdvertise received (reAdvertise=" << isReAdvertise << ", count=" << count << "):";
     for (int i = 0; i < count; ++i) {
         auto set = capsSets[i];
 
@@ -578,8 +659,8 @@ uint32_t VideoStream::onCapsAdvertise(const RDPGFX_CAPS_ADVERTISE_PDU *capsAdver
             break;
         }
 
-        qCDebug(KRDP) << " " << capVersionToString(caps.version) << "flags:" << Qt::hex << set.flags << Qt::dec << "AVC:" << caps.avcSupported
-                      << "YUV420:" << caps.yuv420Supported;
+        qCInfo(KRDP) << " " << capVersionToString(caps.version) << "flags:" << Qt::hex << set.flags << Qt::dec << "AVC:" << caps.avcSupported
+                     << "YUV420:" << caps.yuv420Supported;
 
         capsInformation.push_back(caps);
     }
@@ -600,54 +681,103 @@ uint32_t VideoStream::onCapsAdvertise(const RDPGFX_CAPS_ADVERTISE_PDU *capsAdver
     }
 
     d->negotiatedDesktopMode = negotiatedMode;
-    const EncodingMode initialMode = d->session->isAuthenticated() ? negotiatedMode : EncodingMode::Progressive;
+    const bool authenticated = d->session->isAuthenticated();
+    const EncodingMode initialMode = authenticated ? negotiatedMode : EncodingMode::Progressive;
 
-    QMetaObject::invokeMethod(
-        this,
-        [this, initialMode]() {
-            setActiveEncodingMode(initialMode);
-        },
-        Qt::BlockingQueuedConnection); // RDP callbacks are on the connection thread, VideoStream operates on the main thread
-    qCDebug(KRDP) << "Selected encoding mode:" << encodingModeName(initialMode) << (d->session->isAuthenticated() ? "" : "(in-band greeter mode)");
+    if (authenticated) {
+        if (d->closing.load(std::memory_order_acquire)) {
+            return CHANNEL_RC_OK;
+        }
+        QMetaObject::invokeMethod(
+            this,
+            [this, initialMode]() {
+                setActiveEncodingMode(initialMode);
+            },
+            Qt::BlockingQueuedConnection); // RDP callbacks are on the rdpgfx thread, VideoStream PipeWire objects live on the main thread
+    } else {
+        // Strict pre-auth isolation: never instantiate PipeWire streams or block on
+        // the Qt main thread while in PendingInBandGreeter mode.
+        {
+            std::lock_guard lock(d->frameQueueMutex);
+            d->frameQueue.clear();
+        }
+        d->activeEncodingMode.store(static_cast<int>(EncodingMode::Progressive), std::memory_order_release);
+    }
 
     auto maxVersion = std::max_element(capsInformation.begin(), capsInformation.end(), [](const auto &first, const auto &second) {
         return first.version < second.version;
     });
 
-    qCDebug(KRDP) << "Selected caps:" << capVersionToString(maxVersion->version);
+    qCInfo(KRDP) << "Selected encoding mode:" << encodingModeName(initialMode) << (authenticated ? "" : "(in-band greeter mode)")
+                 << "caps:" << capVersionToString(maxVersion->version) << "flags:" << Qt::hex << maxVersion->capSet.flags << Qt::dec;
 
-    RDPGFX_CAPS_CONFIRM_PDU capsConfirmPdu;
-    capsConfirmPdu.capsSet = &(maxVersion->capSet);
-    const UINT status = d->gfxContext->CapsConfirm(d->gfxContext.get(), &capsConfirmPdu);
-    if (status != CHANNEL_RC_OK) {
-        qCWarning(KRDP) << "CapsConfirm failed" << status;
-        return status;
+    UINT status = CHANNEL_RC_OK;
+    {
+        std::lock_guard gfxLock(d->gfxMutex);
+        if (d->closing.load(std::memory_order_acquire) || !d->gfxContext) {
+            return CHANNEL_RC_OK;
+        }
+        RDPGFX_CAPS_CONFIRM_PDU capsConfirmPdu;
+        capsConfirmPdu.capsSet = &(maxVersion->capSet);
+        status = d->gfxContext->CapsConfirm(d->gfxContext.get(), &capsConfirmPdu);
+        if (status != CHANNEL_RC_OK) {
+            qCWarning(KRDP) << "CapsConfirm failed" << status;
+            return status;
+        }
+        d->capsConfirmed.store(true, std::memory_order_release);
     }
 
-    d->capsConfirmed = true;
-
+    Q_EMIT capsConfirmed();
     return CHANNEL_RC_OK;
 }
 
 uint32_t VideoStream::onFrameAcknowledge(const RDPGFX_FRAME_ACKNOWLEDGE_PDU *frameAcknowledge)
 {
-    auto id = frameAcknowledge->frameId;
+    const uint32_t id = frameAcknowledge->frameId;
 
     std::lock_guard lock(d->pendingFramesMutex);
 
+    const bool wasSuspended = d->frameAcknowledgementSuspended;
     d->frameAcknowledgementSuspended = frameAcknowledge->queueDepth == SUSPEND_FRAME_ACKNOWLEDGEMENT;
     if (d->frameAcknowledgementSuspended) {
+        if (!wasSuspended) {
+            qCInfo(KRDP) << "Client suspended RDPGFX frame acknowledgements (frameId=" << id << ", totalDecoded=" << frameAcknowledge->totalFramesDecoded
+                         << ")";
+        }
         d->pendingFrames.clear();
         return CHANNEL_RC_OK;
     }
+    if (wasSuspended) {
+        qCInfo(KRDP) << "Client resumed RDPGFX frame acknowledgements (frameId=" << id << ", queueDepth=" << frameAcknowledge->queueDepth << ")";
+    }
 
-    auto itr = d->pendingFrames.constFind(id);
-    if (itr == d->pendingFrames.cend()) {
-        qCWarning(KRDP) << "Got frame acknowledge for an unknown frame";
+    // Frames on the single ordered RDPGFX DVC are decoded in FIFO order. Removing
+    // both the exact frameId and any older pending frameIds (wraparound-safe)
+    // prevents coalesced or skipped ACKs from permanently saturating the window.
+    int erasedCount = 0;
+    for (auto itr = d->pendingFrames.begin(); itr != d->pendingFrames.end();) {
+        if (static_cast<int32_t>(id - *itr) >= 0) {
+            itr = d->pendingFrames.erase(itr);
+            erasedCount++;
+        } else {
+            ++itr;
+        }
+    }
+
+    if (erasedCount == 0) {
+        qCWarning(KRDP) << "Got frame acknowledge for an unknown frame:" << id << "(queueDepth=" << frameAcknowledge->queueDepth
+                        << ", totalDecoded=" << frameAcknowledge->totalFramesDecoded << ")";
         return CHANNEL_RC_OK;
     }
 
-    d->pendingFrames.erase(itr);
+    d->acksReceived++;
+    if (d->acksReceived <= 10) {
+        qCInfo(KRDP) << "RDPGFX FrameAcknowledge #" << d->acksReceived << "frameId=" << id << "queueDepth=" << frameAcknowledge->queueDepth
+                     << "totalDecoded=" << frameAcknowledge->totalFramesDecoded << "erased=" << erasedCount << "pendingRemaining=" << d->pendingFrames.size();
+    } else {
+        qCDebug(KRDP) << "RDPGFX FrameAcknowledge #" << d->acksReceived << "frameId=" << id << "queueDepth=" << frameAcknowledge->queueDepth
+                      << "totalDecoded=" << frameAcknowledge->totalFramesDecoded << "erased=" << erasedCount << "pendingRemaining=" << d->pendingFrames.size();
+    }
 
     return CHANNEL_RC_OK;
 }
@@ -680,6 +810,20 @@ bool VideoStream::openChannel()
     return true;
 }
 
+void VideoStream::resetLocalSurfaceState()
+{
+    auto &surface = d->surface->surface;
+    if (surface.id != 0 && d->progressive) {
+        progressive_delete_surface_context(d->progressive.get(), surface.id);
+    }
+    if (d->progressive) {
+        if (!progressive_context_reset(d->progressive.get())) {
+            qCWarning(KRDP) << "progressive_context_reset failed";
+        }
+    }
+    surface = Surface{};
+}
+
 void VideoStream::destroySurface()
 {
     auto &surface = d->surface->surface;
@@ -706,11 +850,7 @@ void VideoStream::destroySurface()
         }
     }
 
-    if (d->progressive) {
-        progressive_delete_surface_context(d->progressive.get(), surface.id);
-    }
-
-    surface = Surface{};
+    resetLocalSurfaceState();
 }
 
 void VideoStream::performReset(QSize newSize)
@@ -757,13 +897,17 @@ void VideoStream::performReset(QSize newSize)
         return;
     }
 
+    const auto mode = activeEncodingMode();
     surface = Surface{
         .id = surfaceId,
-        .codecContextId = d->activeEncodingMode == EncodingMode::Progressive ? ProgressiveCodecContextId : 0,
+        .codecContextId = mode == EncodingMode::Progressive ? ProgressiveCodecContextId : 0,
         .size = newSize,
     };
 
-    if (d->activeEncodingMode == EncodingMode::Progressive) {
+    if (mode == EncodingMode::Progressive) {
+        if (!progressive_context_reset(d->progressive.get())) {
+            qCWarning(KRDP) << "Failed to reset progressive codec context";
+        }
         if (progressive_create_surface_context(d->progressive.get(), surfaceId, newSize.width(), newSize.height()) < 0) {
             qCWarning(KRDP) << "Failed to create progressive surface context";
             destroySurface();
@@ -779,7 +923,17 @@ void VideoStream::performReset(QSize newSize)
     if (status != CHANNEL_RC_OK) {
         qCWarning(KRDP) << "MapSurfaceToOutput failed" << status << "surface" << surfaceId;
         destroySurface();
+        return;
     }
+
+    if (mode == EncodingMode::H264) {
+        d->awaitingH264KeyFrame = true;
+    } else {
+        d->awaitingH264KeyFrame = false;
+    }
+
+    qCInfo(KRDP) << "RDPGFX surface reset complete: surfaceId=" << surfaceId << "size=" << newSize
+                 << "mode=" << (mode ? encodingModeName(*mode) : QStringLiteral("unset")) << "quality=" << int(d->quality) << "adaptive=" << d->adaptiveQuality;
 }
 
 double VideoStream::effectiveProducerFps()
@@ -855,7 +1009,7 @@ void VideoStream::updateInFlightWindow()
 
 void VideoStream::updateAdaptiveQuality()
 {
-    if (!d->adaptiveQuality || d->activeEncodingMode != EncodingMode::H264) {
+    if (!d->adaptiveQuality || activeEncodingMode() != EncodingMode::H264) {
         return;
     }
 
@@ -914,25 +1068,33 @@ void VideoStream::sendFrame(const VideoFrame &frame)
 {
     auto peer = d->session->rdpPeer();
     if (peer->IsWriteBlocked && peer->IsWriteBlocked(peer)) {
+        // Preserve the frame if nothing newer has arrived so greeter redraws aren't silently lost.
+        {
+            std::lock_guard lock(d->frameQueueMutex);
+            if (d->frameQueue.isEmpty()) {
+                d->frameQueue.prepend(frame);
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
         return;
     }
 
-    if (!d->gfxContext || !d->capsConfirmed) {
-        return;
-    }
+    {
+        std::lock_guard gfxLock(d->gfxMutex);
+        if (!d->gfxContext || !d->capsConfirmed.load(std::memory_order_acquire)) {
+            return;
+        }
 
-    if (d->surface->pendingReset) {
-        d->surface->pendingReset = false;
-        performReset(frame.size);
-    }
-    if (d->surface->surface.size != frame.size) {
-        performReset(frame.size);
-    }
+        if (d->surface->pendingReset.exchange(false, std::memory_order_acq_rel) || d->surface->surface.id == 0 || d->surface->surface.size != frame.size) {
+            performReset(frame.size);
+        }
 
-    if (d->activeEncodingMode == EncodingMode::H264) {
-        sendFrameH264(frame);
-    } else if (d->activeEncodingMode == EncodingMode::Progressive) {
-        sendFrameProgressive(frame);
+        const auto mode = activeEncodingMode();
+        if (mode == EncodingMode::H264) {
+            sendFrameH264(frame);
+        } else if (mode == EncodingMode::Progressive) {
+            sendFrameProgressive(frame);
+        }
     }
 
     QMetaObject::invokeMethod(this, &VideoStream::updateBackpressure, Qt::QueuedConnection);
@@ -949,7 +1111,18 @@ void VideoStream::sendFrameH264(const VideoFrame &frame)
         return;
     }
 
-    auto frameId = d->frameId++;
+    if (d->awaitingH264KeyFrame) {
+        if (!frame.isKeyFrame) {
+            qCDebug(KRDP) << "Skipping non-keyframe H.264 packet on freshly reset surface" << d->surface->surface.id;
+            return;
+        }
+        d->awaitingH264KeyFrame = false;
+    }
+
+    const uint32_t frameId = d->frameId++;
+    if (d->frameId == 0) {
+        d->frameId = 1;
+    }
 
     {
         std::lock_guard lock(d->pendingFramesMutex);
@@ -1003,6 +1176,8 @@ void VideoStream::sendFrameH264(const VideoFrame &frame)
     const UINT startStatus = d->gfxContext->StartFrame(d->gfxContext.get(), &startFramePdu);
     if (startStatus != CHANNEL_RC_OK) {
         qCWarning(KRDP) << "StartFrame failed" << startStatus << "frameId" << frameId;
+        std::lock_guard lock(d->pendingFramesMutex);
+        d->pendingFrames.remove(frameId);
         return;
     }
 
@@ -1015,7 +1190,12 @@ void VideoStream::sendFrameH264(const VideoFrame &frame)
     const UINT endStatus = d->gfxContext->EndFrame(d->gfxContext.get(), &endFramePdu);
     if (endStatus != CHANNEL_RC_OK) {
         qCWarning(KRDP) << "EndFrame failed" << endStatus << "frameId" << frameId;
+        std::lock_guard lock(d->pendingFramesMutex);
+        d->pendingFrames.remove(frameId);
+        return;
     }
+
+    d->framesSent++;
 }
 
 void VideoStream::sendFrameProgressive(const VideoFrame &frame)
@@ -1057,13 +1237,18 @@ void VideoStream::sendFrameProgressive(const VideoFrame &frame)
         return;
     }
 
-    auto frameId = d->frameId++;
+    const uint32_t frameId = d->frameId++;
+    if (d->frameId == 0) {
+        d->frameId = 1;
+    }
 
+    qsizetype pendingCount = 0;
     {
         std::lock_guard lock(d->pendingFramesMutex);
         if (!d->frameAcknowledgementSuspended) {
             d->pendingFrames.insert(frameId);
         }
+        pendingCount = d->pendingFrames.size();
     }
 
     RDPGFX_START_FRAME_PDU startFramePdu;
@@ -1096,6 +1281,17 @@ void VideoStream::sendFrameProgressive(const VideoFrame &frame)
     if (status != CHANNEL_RC_OK) {
         qCWarning(KRDP) << "SurfaceFrameCommand failed" << status << "frameId" << frameId << "surface" << d->surface->surface.id << "encodedBytes"
                         << encodedSize << "damageRects" << rectCount;
+        std::lock_guard lock(d->pendingFramesMutex);
+        d->pendingFrames.remove(frameId);
+    } else {
+        d->framesSent++;
+        if (d->framesSent <= 10) {
+            qCInfo(KRDP) << "RDPGFX Progressive frame sent #" << d->framesSent << "frameId=" << frameId << "surfaceId=" << d->surface->surface.id
+                         << "size=" << frame.size << "encodedBytes=" << encodedSize << "pendingCount=" << pendingCount;
+        } else {
+            qCDebug(KRDP) << "RDPGFX Progressive frame sent #" << d->framesSent << "frameId=" << frameId << "surfaceId=" << d->surface->surface.id
+                          << "size=" << frame.size << "encodedBytes=" << encodedSize << "pendingCount=" << pendingCount;
+        }
     }
 
     region16_uninit(&*invalidRegion);
