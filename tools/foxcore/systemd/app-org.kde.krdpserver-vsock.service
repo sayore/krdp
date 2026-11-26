@@ -11,8 +11,10 @@ Type=exec
 ExecStart=@KRDPSERVER_BIN@ --transport vsock --port @VSOCK_PORT@ --vsock-peer-cid @VSOCK_PEER_CID@ --pam --certificate @CERT_FILE@ --certificate-key @KEY_FILE@
 Restart=on-abnormal
 RestartSec=2
-NoNewPrivileges=yes
-PrivateTmp=yes
+# Note: Do NOT set NoNewPrivileges=yes or PrivateTmp=yes in this user unit.
+# PAM authentication via pam_unix executes setuid /usr/bin/unix_chkpwd, and in
+# systemd --user services PrivateTmp=yes creates an unprivileged user namespace
+# where root (UID 0) is unmapped, breaking setuid unix_chkpwd (/etc/shadow).
 
 [Install]
 WantedBy=plasma-workspace.target

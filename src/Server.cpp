@@ -4,11 +4,15 @@
 
 #include "Server.h"
 
+#include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstring>
+#include <mutex>
 #include <vector>
 
 #include <QCoreApplication>
+#include <QHash>
 #include <QSocketNotifier>
 
 #ifdef HAVE_LINUX_VM_SOCKETS_H
@@ -57,6 +61,14 @@ public:
 
     QList<User> users;
     bool usePamAuthentication = false;
+
+    mutable std::mutex authThrottleMutex;
+    static constexpr qsizetype MaxTrackedAuthUsers = 256;
+    int maxFailuresPerUser = 5;
+    int authWindowMs = 300'000;
+    int authLockoutMs = 30'000;
+    QHash<QString, std::vector<std::chrono::steady_clock::time_point>> userAuthFailures;
+    QHash<QString, std::chrono::steady_clock::time_point> userAuthLockedUntil;
 
     std::filesystem::path tlsCertificate;
     std::filesystem::path tlsCertificateKey;
@@ -350,6 +362,116 @@ bool Server::usePAMAuthentication() const
 void Server::setUsePAMAuthentication(bool usePAM)
 {
     d->usePamAuthentication = usePAM;
+}
+
+void Server::setAuthThrottlePolicy(int maxFailuresPerUser, int windowMs, int lockoutMs)
+{
+    std::lock_guard lock(d->authThrottleMutex);
+    d->maxFailuresPerUser = std::max(1, maxFailuresPerUser);
+    d->authWindowMs = std::max(100, windowMs);
+    d->authLockoutMs = std::max(100, lockoutMs);
+    d->userAuthFailures.clear();
+    d->userAuthLockedUntil.clear();
+}
+
+bool Server::isAuthAttemptAllowed(const QString &username) const
+{
+    const QString key = username.section(QLatin1Char('\\'), -1).trimmed().toLower();
+    if (key.isEmpty()) {
+        return true;
+    }
+    const auto now = std::chrono::steady_clock::now();
+
+    std::lock_guard lock(d->authThrottleMutex);
+    const auto it = d->userAuthLockedUntil.constFind(key);
+    if (it != d->userAuthLockedUntil.cend()) {
+        if (now < it.value()) {
+            return false;
+        }
+        d->userAuthLockedUntil.erase(it);
+    }
+    return true;
+}
+
+void Server::recordAuthFailure(const QString &username)
+{
+    const QString key = username.section(QLatin1Char('\\'), -1).trimmed().toLower();
+    if (key.isEmpty()) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+
+    std::lock_guard lock(d->authThrottleMutex);
+    const auto window = std::chrono::milliseconds(d->authWindowMs);
+    const auto lockout = std::chrono::milliseconds(d->authLockoutMs);
+    const auto cutoff = now - window;
+
+    // Prune expired lockout & failure entries to prevent unbounded memory growth.
+    for (auto it = d->userAuthLockedUntil.begin(); it != d->userAuthLockedUntil.end();) {
+        if (now >= it.value()) {
+            it = d->userAuthLockedUntil.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (auto it = d->userAuthFailures.begin(); it != d->userAuthFailures.end();) {
+        auto &vec = it.value();
+        vec.erase(std::remove_if(vec.begin(),
+                                 vec.end(),
+                                 [cutoff](const auto &tp) {
+                                     return tp < cutoff;
+                                 }),
+                  vec.end());
+        if (vec.empty()) {
+            it = d->userAuthFailures.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    // Enforce strict hard ceiling on tracked accounts (evict oldest entry if full).
+    if (!d->userAuthFailures.contains(key) && d->userAuthFailures.size() >= Private::MaxTrackedAuthUsers) {
+        auto oldestIt = d->userAuthFailures.begin();
+        for (auto it = d->userAuthFailures.begin(); it != d->userAuthFailures.end(); ++it) {
+            if (!it.value().empty() && (oldestIt.value().empty() || it.value().back() < oldestIt.value().back())) {
+                oldestIt = it;
+            }
+        }
+        d->userAuthFailures.erase(oldestIt);
+    }
+
+    auto &failures = d->userAuthFailures[key];
+    failures.push_back(now);
+    if (static_cast<int>(failures.size()) >= d->maxFailuresPerUser) {
+        if (!d->userAuthLockedUntil.contains(key) && d->userAuthLockedUntil.size() >= Private::MaxTrackedAuthUsers) {
+            auto earliestIt = d->userAuthLockedUntil.begin();
+            for (auto it = d->userAuthLockedUntil.begin(); it != d->userAuthLockedUntil.end(); ++it) {
+                if (it.value() < earliestIt.value()) {
+                    earliestIt = it;
+                }
+            }
+            d->userAuthLockedUntil.erase(earliestIt);
+        }
+        d->userAuthLockedUntil[key] = now + lockout;
+        d->userAuthFailures.remove(key);
+        qCWarning(KRDP) << "Cross-connection authentication lockout triggered for bucket" << key << "for" << d->authLockoutMs << "ms";
+    }
+}
+
+void Server::recordAuthSuccess(const QString &username)
+{
+    const QString key = username.section(QLatin1Char('\\'), -1).trimmed().toLower();
+    std::lock_guard lock(d->authThrottleMutex);
+    if (!key.isEmpty()) {
+        d->userAuthFailures.remove(key);
+        d->userAuthLockedUntil.remove(key);
+    }
+}
+
+qsizetype Server::trackedAuthThrottleEntries() const
+{
+    std::lock_guard lock(d->authThrottleMutex);
+    return d->userAuthFailures.size() + d->userAuthLockedUntil.size();
 }
 
 std::filesystem::path Server::tlsCertificate() const

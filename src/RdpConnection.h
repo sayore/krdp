@@ -114,6 +114,8 @@ public:
      */
     AuthState authState() const;
     bool isAuthenticated() const;
+    QString authenticatedUser() const;
+    bool authenticatedViaPam() const;
     Q_SIGNAL void authStateChanged(AuthState newAuthState);
     Q_SIGNAL void authenticatedChanged(bool authenticated);
 

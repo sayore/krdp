@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <mutex>
 #include <optional>
 
 #include <fcntl.h>
@@ -278,10 +279,14 @@ class KRDP_NO_EXPORT RdpConnection::Private
 public:
     Server *server = nullptr;
 
-    State state = State::Initial;
+    std::atomic<State> state{State::Initial};
     std::atomic<AuthState> authState{AuthState::Unauthenticated};
+    mutable std::mutex authUserMutex;
+    QString authenticatedUser;
+    mutable std::atomic<bool> authenticatedViaPam{false};
     bool qualitySeeded = false;
     bool greeterStarted = false;
+    int activateCount = 0;
 
     qintptr socketHandle;
     TransportInfo transportInfo;
@@ -334,9 +339,15 @@ RdpConnection::RdpConnection(Server *server, qintptr socketHandle, const Transpo
     d->inBandGreeter = std::make_unique<InBandGreeter>(this);
     d->videoStream = std::make_unique<VideoStream>(this);
     connect(d->videoStream.get(), &VideoStream::closed, this, [this]() {
-        if (d->state == State::Running || d->state == State::Streaming) {
+        const State cur = state();
+        if (cur == State::Running || cur == State::Streaming) {
             qCDebug(KRDP) << "Video stream closed, closing session";
             d->requestStop();
+        }
+    });
+    connect(d->videoStream.get(), &VideoStream::capsConfirmed, d->inBandGreeter.get(), [this]() {
+        if (d->authState.load(std::memory_order_acquire) == AuthState::PendingInBandGreeter) {
+            d->inBandGreeter->requestRedraw();
         }
     });
     d->cursor = std::make_unique<Cursor>(this);
@@ -365,7 +376,12 @@ RdpConnection::RdpConnection(Server *server, qintptr socketHandle, const Transpo
         frame.damage = QRegion(QRect(QPoint(0, 0), image.size()));
         d->videoStream->queueFrame(frame);
     });
-    connect(d->inBandGreeter.get(), &InBandGreeter::authenticated, this, [this](const QString &) {
+    connect(d->inBandGreeter.get(), &InBandGreeter::authenticated, this, [this](const QString &user) {
+        {
+            std::lock_guard lock(d->authUserMutex);
+            d->authenticatedUser = user.section(QLatin1Char('\\'), -1).trimmed();
+        }
+        qCInfo(KRDP) << "Transitioning connection from PendingInBandGreeter to Authenticated for user" << authenticatedUser();
         setAuthState(AuthState::Authenticated);
         d->videoStream->onSessionAuthenticated();
     });
@@ -386,7 +402,7 @@ RdpConnection::~RdpConnection()
     if (d->thread.joinable()) {
         d->requestStop();
         d->thread.join();
-    } else if (d->peer && d->state != State::Closed) {
+    } else if (d->peer && state() != State::Closed) {
         // The run thread was never started (peer set up but initialize failed):
         // nothing else touches the peer, so close it here before freeing.
         d->peer->Close(d->peer);
@@ -406,16 +422,16 @@ RdpConnection::~RdpConnection()
 
 RdpConnection::State RdpConnection::state() const
 {
-    return d->state;
+    return d->state.load(std::memory_order_acquire);
 }
 
 void RdpConnection::setState(KRdp::RdpConnection::State newState)
 {
-    if (newState == d->state) {
+    const State prev = d->state.exchange(newState, std::memory_order_acq_rel);
+    if (prev == newState) {
         return;
     }
 
-    d->state = newState;
     Q_EMIT stateChanged(newState);
 }
 
@@ -427,6 +443,17 @@ RdpConnection::AuthState RdpConnection::authState() const
 bool RdpConnection::isAuthenticated() const
 {
     return d->authState.load(std::memory_order_acquire) == AuthState::Authenticated;
+}
+
+QString RdpConnection::authenticatedUser() const
+{
+    std::lock_guard lock(d->authUserMutex);
+    return d->authenticatedUser;
+}
+
+bool RdpConnection::authenticatedViaPam() const
+{
+    return d->authenticatedViaPam.load(std::memory_order_acquire);
 }
 
 void RdpConnection::setAuthState(AuthState newAuthState)
@@ -455,6 +482,7 @@ void RdpConnection::startInBandGreeter()
     }
     d->greeterStarted = true;
     QSize initialSize(1280, 720);
+    quint32 keyboardLayout = 0;
     if (d->peer && d->peer->context && d->peer->context->settings) {
         auto *settings = d->peer->context->settings;
         const int w = static_cast<int>(freerdp_settings_get_uint32(settings, FreeRDP_DesktopWidth));
@@ -462,48 +490,82 @@ void RdpConnection::startInBandGreeter()
         if (w >= 640 && h >= 480) {
             initialSize = QSize(w, h);
         }
+        keyboardLayout = freerdp_settings_get_uint32(settings, FreeRDP_KeyboardLayout);
     }
     QString defaultUser = KUser().loginName();
     if (defaultUser == QStringLiteral("plasmalogin") || isDisallowedLoginUser(defaultUser)) {
         defaultUser.clear();
     }
+    d->inBandGreeter->setKeyboardLayout(keyboardLayout);
     d->inBandGreeter->start(initialSize, defaultUser);
 }
 
 bool RdpConnection::verifyGuestCredentials(const QString &username, const QString &password) const
 {
     const QString normalized = username.section(QLatin1Char('\\'), -1).trimmed();
+    const QString sessionOwner = KUser().loginName();
+    const auto configuredUsers = d->server->users();
+
+    bool isKnownAccount = false;
+    if (!normalized.isEmpty() && !isDisallowedLoginUser(normalized)) {
+        if (d->server->usePAMAuthentication() && (normalized == sessionOwner || sessionOwner == QStringLiteral("plasmalogin"))) {
+            isKnownAccount = true;
+        } else {
+            for (const auto &user : configuredUsers) {
+                if (!user.password.isEmpty() && !isDisallowedLoginUser(user.name) && user.name == normalized) {
+                    isKnownAccount = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    // Route unknown or disallowed usernames (e.g. "root" or random probing) into a
+    // dedicated shared throttle bucket so they are rate-limited without growing maps
+    // unboundedly or locking out legitimate users via cross-user DoS.
+    const QString throttleBucket = isKnownAccount ? normalized : QStringLiteral("<unknown-or-disallowed>");
+
+    if (!d->server->isAuthAttemptAllowed(throttleBucket)) {
+        qCWarning(KRDP) << "Rejecting authentication attempt for bucket" << throttleBucket << "(cross-connection rate limit active)";
+        return false;
+    }
+
     if (normalized.isEmpty() || password.isEmpty() || isDisallowedLoginUser(normalized)) {
+        d->server->recordAuthFailure(throttleBucket);
         return false;
     }
 
     if (d->server->usePAMAuthentication()) {
         qCDebug(KRDP) << "Attempting authenticating user with PAM";
-        if (normalized == KUser().loginName() || KUser().loginName() == QStringLiteral("plasmalogin")) {
+        if (normalized == sessionOwner || sessionOwner == QStringLiteral("plasmalogin")) {
             if (pamAuthenticate(normalized, password) >= 0) {
                 qCDebug(KRDP) << "PAM authentication succeeded for user" << normalized;
+                d->authenticatedViaPam.store(true, std::memory_order_release);
+                d->server->recordAuthSuccess(throttleBucket);
                 return true;
             }
         }
     }
 
-    const auto users = d->server->users();
-    for (const auto &user : users) {
+    for (const auto &user : configuredUsers) {
         if (user.password.isEmpty() || isDisallowedLoginUser(user.name)) {
             continue;
         }
         if (user.name == normalized && user.password == password) {
             qCDebug(KRDP) << "User" << normalized << "authenticated successfully";
+            d->authenticatedViaPam.store(false, std::memory_order_release);
+            d->server->recordAuthSuccess(throttleBucket);
             return true;
         }
     }
 
+    d->server->recordAuthFailure(throttleBucket);
     return false;
 }
 
 void RdpConnection::close(RdpConnection::CloseReason reason)
 {
-    if (d->state == State::Closed) {
+    if (state() == State::Closed) {
         return;
     }
 
@@ -724,6 +786,7 @@ void RdpConnection::initialize()
     freerdp_settings_set_bool(settings, FreeRDP_SupportDynamicChannels, true);
 
     freerdp_settings_set_bool(settings, FreeRDP_HasExtendedMouseEvent, true);
+    freerdp_settings_set_bool(settings, FreeRDP_HasRelativeMouseEvent, false);
     freerdp_settings_set_bool(settings, FreeRDP_HasHorizontalWheel, true);
     freerdp_settings_set_bool(settings, FreeRDP_UnicodeInput, true);
 
@@ -772,9 +835,9 @@ void RdpConnection::run(std::stop_token stopToken)
 {
     auto context = reinterpret_cast<PeerContext *>(d->peer->context);
     auto channelEvent = WTSVirtualChannelManagerGetEventHandle(context->virtualChannelManager);
-    bool audioInitAttempted = false;
     BYTE lastDrdynvcState = 0xFF;
     bool lastDrdynvcJoined = false;
+    bool audioInitAttempted = false;
     setState(State::Running);
 
     while (!stopToken.stop_requested()) {
@@ -783,21 +846,26 @@ void RdpConnection::run(std::stop_token stopToken)
         std::array<HANDLE, 33> events{channelEvent, d->stopEvent};
         auto handleCount = d->peer->GetEventHandles(d->peer, events.data() + 2, 31);
         if (handleCount <= 0) {
-            qCDebug(KRDP) << "Unable to get transport event handles";
+            qCWarning(KRDP) << "RDP event loop exiting: unable to get transport event handles";
             break;
         }
         // Wait for something to happen on the connection.
-        WaitForMultipleObjects(2 + handleCount, events.data(), FALSE, INFINITE);
+        const DWORD waitStatus = WaitForMultipleObjects(2 + handleCount, events.data(), FALSE, INFINITE);
+        if (waitStatus == WAIT_FAILED) {
+            qCWarning(KRDP) << "RDP event loop exiting: WaitForMultipleObjects failed";
+            break;
+        }
 
         // Bail out before touching the peer transport if we were asked to stop,
         // so teardown stays race-free.
         if (stopToken.stop_requested()) {
+            qCInfo(KRDP) << "RDP event loop exiting: stop requested";
             break;
         }
 
         // Read data from the socket and have FreeRDP process it.
         if (d->peer->CheckFileDescriptor(d->peer) != TRUE) {
-            qCDebug(KRDP) << "Unable to check file descriptor";
+            qCInfo(KRDP) << "RDP event loop exiting: peer CheckFileDescriptor returned FALSE";
             break;
         }
 
@@ -805,26 +873,27 @@ void RdpConnection::run(std::stop_token stopToken)
         const bool drdynvcJoined = WTSVirtualChannelManagerIsChannelJoined(context->virtualChannelManager, DRDYNVC_SVC_CHANNEL_NAME);
         const BYTE drdynvcState = WTSVirtualChannelManagerGetDrdynvcState(context->virtualChannelManager);
 
-        if (d->peer->connected && d->state == State::Activated && drdynvcJoined && drdynvcState == DRDYNVC_STATE_NONE) {
+        if (d->peer->connected && state() == State::Activated && drdynvcJoined && drdynvcState == DRDYNVC_STATE_NONE) {
             if (WTSVirtualChannelManagerOpen(context->virtualChannelManager) != TRUE) {
-                qCDebug(KRDP) << "Unable to open Virtual Channel Manager for drdynvc";
+                qCWarning(KRDP) << "RDP event loop exiting: unable to open Virtual Channel Manager for drdynvc";
                 break;
             }
         }
 
         if (WTSVirtualChannelManagerCheckFileDescriptorEx(context->virtualChannelManager, FALSE) != TRUE) {
-            qCDebug(KRDP) << "Unable to check Virtual Channel Manager file descriptor, closing connection";
+            qCWarning(KRDP) << "RDP event loop exiting: Virtual Channel Manager CheckFileDescriptorEx failed";
             break;
         }
 
-        if (d->peer->connected && (d->state == State::Activated || d->state == State::Streaming) && cliprdrJoined && isAuthenticated()) {
+        if (d->peer->connected && (state() == State::Activated || state() == State::Streaming) && cliprdrJoined && isAuthenticated()) {
             if (!d->clipboard->initialize()) {
+                qCWarning(KRDP) << "RDP event loop exiting: clipboard initialization failed";
                 break;
             }
         }
 
         const bool rdpsndSvcJoined = WTSVirtualChannelManagerIsChannelJoined(context->virtualChannelManager, RDPSND_CHANNEL_NAME);
-        if (!audioInitAttempted && d->peer->connected && (d->state == State::Activated || d->state == State::Streaming) && isAuthenticated()) {
+        if (!audioInitAttempted && d->peer->connected && (state() == State::Activated || state() == State::Streaming) && isAuthenticated()) {
             const bool drdynvcReady = drdynvcJoined && drdynvcState == DRDYNVC_STATE_READY;
             if (drdynvcReady || rdpsndSvcJoined) {
                 audioInitAttempted = true;
@@ -841,26 +910,31 @@ void RdpConnection::run(std::stop_token stopToken)
             }
         }
 
-        if (d->peer->connected && d->state == State::Activated && drdynvcJoined && drdynvcState == DRDYNVC_STATE_READY) {
+        if (d->peer->connected && state() == State::Activated && drdynvcJoined && drdynvcState == DRDYNVC_STATE_READY) {
             if (!d->displayControl->initialize()) {
+                qCWarning(KRDP) << "RDP event loop exiting: display control initialization failed";
                 break;
             }
             if (!d->videoStream->initialize()) {
+                qCWarning(KRDP) << "RDP event loop exiting: video stream initialization failed";
                 break;
             }
             d->videoStream->setEnabled(true);
         }
 
         if (drdynvcJoined != lastDrdynvcJoined || drdynvcState != lastDrdynvcState) {
+            qCInfo(KRDP) << "Dynamic virtual channel state transition: drdynvcJoined=" << drdynvcJoined << "drdynvcState=" << int(drdynvcState)
+                         << "cliprdrJoined=" << cliprdrJoined;
             lastDrdynvcJoined = drdynvcJoined;
             lastDrdynvcState = drdynvcState;
         }
 
-        if (d->peer->connected && d->state == State::Activated && drdynvcJoined) {
+        if (d->peer->connected && state() == State::Activated && drdynvcJoined) {
             if (drdynvcState == DRDYNVC_STATE_READY) {
                 if (!d->videoStream->openChannel()) {
                     qCWarning(KRDP) << "Unable to open RDPGFX channel";
                 } else {
+                    qCInfo(KRDP) << "RDPGFX channel opened; entering State::Streaming (authState=" << int(authState()) << ")";
                     setState(State::Streaming);
                     if (d->authState.load(std::memory_order_acquire) == AuthState::PendingInBandGreeter) {
                         QMetaObject::invokeMethod(this, &RdpConnection::startInBandGreeter, Qt::QueuedConnection);
@@ -903,6 +977,12 @@ bool RdpConnection::onCapabilities()
         return false;
     }
 
+    qCInfo(KRDP) << "Peer capabilities negotiated: desktop=" << freerdp_settings_get_uint32(settings, FreeRDP_DesktopWidth) << "x"
+                 << freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight)
+                 << "fastPathInput=" << freerdp_settings_get_bool(settings, FreeRDP_FastPathInput)
+                 << "unicodeInput=" << freerdp_settings_get_bool(settings, FreeRDP_UnicodeInput)
+                 << "pointerCache=" << freerdp_settings_get_uint32(settings, FreeRDP_PointerCacheSize);
+
     return true;
 }
 
@@ -928,6 +1008,8 @@ static std::optional<quint8> qualitySeedForConnectionType(uint32_t connectionTyp
 
 bool RdpConnection::onActivate()
 {
+    d->activateCount++;
+    qCInfo(KRDP) << "Peer activated (count=" << d->activateCount << ", authState=" << int(authState()) << ")";
     setState(State::Activated);
 
     if (!d->qualitySeeded) {
@@ -983,6 +1065,10 @@ bool RdpConnection::onPostConnect()
         }
 
         if (verifyGuestCredentials(username, password)) {
+            {
+                std::lock_guard lock(d->authUserMutex);
+                d->authenticatedUser = username.trimmed();
+            }
             setAuthState(AuthState::Authenticated);
             return true;
         }
@@ -992,6 +1078,10 @@ bool RdpConnection::onPostConnect()
     } else {
         // In the standard TCP NLA case, the user has been authorised against the SAM database
         // (from which disallowed/root users are excluded).
+        {
+            std::lock_guard lock(d->authUserMutex);
+            d->authenticatedUser = username.trimmed();
+        }
         setAuthState(AuthState::Authenticated);
         return true;
     }
@@ -999,17 +1089,24 @@ bool RdpConnection::onPostConnect()
 
 bool RdpConnection::onClose()
 {
+    qCInfo(KRDP) << "Closing RDP connection (authState=" << int(authState()) << ")";
     QMetaObject::invokeMethod(d->inBandGreeter.get(), &InBandGreeter::stop, Qt::QueuedConnection);
     d->displayControl->close();
     d->clipboard->close();
     d->audioStream->close();
     d->videoStream->close();
+    {
+        std::lock_guard lock(d->authUserMutex);
+        d->authenticatedUser.clear();
+    }
+    d->authenticatedViaPam.store(false, std::memory_order_release);
     setState(State::Closed);
     return true;
 }
 
 bool RdpConnection::onSuppressOutput(uint8_t allow)
 {
+    qCInfo(KRDP) << "Client SuppressOutput PDU:" << (allow ? "allow" : "suppress");
     if (allow) {
         d->videoStream->setEnabled(true);
     } else {
