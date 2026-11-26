@@ -16,6 +16,10 @@ endif()
 
 target_sources(KRdp PRIVATE
     AbstractSession.cpp
+    AudioInputStream.cpp
+    AudioInputStream.h
+    AudioStream.cpp
+    AudioStream.h
     Clipboard.cpp
     Clipboard.h
     DisplayControl.cpp
@@ -61,6 +65,11 @@ qt6_add_dbus_interface(_dbus_sources xdp_dbus_screencast_interface.xml xdp_dbus_
 target_sources(KRdp PRIVATE ${_dbus_sources})
 
 target_include_directories(KRdp PUBLIC ${FreeRDP_INCLUDE_DIR} ${WinPR_INCLUDE_DIR} ${FreeRDP_Server_INCLUDE_DIR})
+
+if(PipeWire_FOUND)
+    target_compile_definitions(KRdp PRIVATE HAVE_PIPEWIRE_AUDIO)
+    target_link_libraries(KRdp PRIVATE PkgConfig::PipeWire)
+endif()
 
 target_link_libraries(KRdp PUBLIC
     Qt::Core

@@ -25,8 +25,11 @@
 #include <freerdp/server/cliprdr.h>
 
 #include <freerdp/channels/drdynvc.h>
+#include <freerdp/channels/rdpsnd.h>
 
 #include "AbstractSession.h"
+#include "AudioInputStream.h"
+#include "AudioStream.h"
 #include "Clipboard.h"
 #include "Cursor.h"
 #include "DisplayControl.h"
@@ -248,6 +251,8 @@ public:
     qintptr socketHandle;
 
     std::unique_ptr<InputHandler> inputHandler;
+    std::unique_ptr<AudioInputStream> audioInputStream;
+    std::unique_ptr<AudioStream> audioStream;
     std::unique_ptr<VideoStream> videoStream;
     std::unique_ptr<Cursor> cursor;
     std::unique_ptr<NetworkDetection> networkDetection;
@@ -294,6 +299,8 @@ RdpConnection::RdpConnection(Server *server, qintptr socketHandle)
     d->cursor = std::make_unique<Cursor>(this);
     d->networkDetection = std::make_unique<NetworkDetection>(this);
     d->clipboard = std::make_unique<Clipboard>(this);
+    d->audioStream = std::make_unique<AudioStream>(this);
+    d->audioInputStream = std::make_unique<AudioInputStream>(this);
     d->displayControl = std::make_unique<DisplayControl>(this);
 
     QMetaObject::invokeMethod(this, &RdpConnection::initialize, Qt::QueuedConnection);
@@ -382,6 +389,16 @@ Clipboard *RdpConnection::clipboard() const
     return d->clipboard.get();
 }
 
+AudioStream *RdpConnection::audioStream() const
+{
+    return d->audioStream.get();
+}
+
+AudioInputStream *RdpConnection::audioInputStream() const
+{
+    return d->audioInputStream.get();
+}
+
 DisplayControl *RdpConnection::displayControl() const
 {
     return d->displayControl.get();
@@ -458,8 +475,8 @@ void RdpConnection::initialize()
     // PSEUDO_XSERVER is apparently required for things to work properly.
     freerdp_settings_set_uint32(settings, FreeRDP_OsMinorType, OSMINORTYPE_PSEUDO_XSERVER);
 
-    // TODO: Implement audio support
-    freerdp_settings_set_bool(settings, FreeRDP_AudioPlayback, false);
+    freerdp_settings_set_bool(settings, FreeRDP_AudioPlayback, true);
+    freerdp_settings_set_bool(settings, FreeRDP_AudioCapture, true);
 
     freerdp_settings_set_uint32(settings, FreeRDP_ColorDepth, 32);
 
@@ -482,7 +499,7 @@ void RdpConnection::initialize()
     freerdp_settings_set_bool(settings, FreeRDP_NetworkAutoDetect, true);
 
     freerdp_settings_set_bool(settings, FreeRDP_RefreshRect, true);
-    freerdp_settings_set_bool(settings, FreeRDP_RemoteConsoleAudio, true);
+    freerdp_settings_set_bool(settings, FreeRDP_RemoteConsoleAudio, false);
     freerdp_settings_set_bool(settings, FreeRDP_RemoteFxCodec, false);
     freerdp_settings_set_bool(settings, FreeRDP_NSCodec, false);
     freerdp_settings_set_bool(settings, FreeRDP_FrameMarkerCommandEnabled, true);
@@ -490,7 +507,6 @@ void RdpConnection::initialize()
 
     freerdp_settings_set_bool(settings, FreeRDP_SupportMonitorLayoutPdu, true);
     freerdp_settings_set_bool(settings, FreeRDP_SupportDisplayControl, true);
-
 
     d->peer->Capabilities = peerCapabilities;
     d->peer->Activate = peerActivate;
@@ -524,6 +540,8 @@ void RdpConnection::run(std::stop_token stopToken)
 {
     auto context = reinterpret_cast<PeerContext *>(d->peer->context);
     auto channelEvent = WTSVirtualChannelManagerGetEventHandle(context->virtualChannelManager);
+    bool audioInitAttempted = false;
+    bool audioInputInitAttempted = false;
     BYTE lastDrdynvcState = 0xFF;
     bool lastDrdynvcJoined = false;
     setState(State::Running);
@@ -628,7 +646,7 @@ bool RdpConnection::onCapabilities()
         freerdp_settings_set_uint32(settings, FreeRDP_ColorDepth, 32);
     }
 
-    if (freerdp_settings_get_uint32(settings,FreeRDP_PointerCacheSize) <= 0) {
+    if (freerdp_settings_get_uint32(settings, FreeRDP_PointerCacheSize) <= 0) {
         qCWarning(KRDP) << "Client doesn't support pointer caching, aborting";
         return false;
     }
@@ -717,6 +735,8 @@ bool RdpConnection::onClose()
 {
     d->displayControl->close();
     d->clipboard->close();
+    d->audioInputStream->close();
+    d->audioStream->close();
     d->videoStream->close();
     setState(State::Closed);
     return true;
