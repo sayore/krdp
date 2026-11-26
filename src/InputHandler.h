@@ -13,6 +13,8 @@
 
 #include "krdp_export.h"
 
+class InputHandlerTest;
+
 namespace KRdp
 {
 
@@ -52,6 +54,7 @@ private:
     friend BOOL inputExtendedMouseEvent(rdpInput *, uint16_t, uint16_t, uint16_t);
     friend BOOL inputKeyboardEvent(rdpInput *, uint16_t, uint8_t);
     friend BOOL inputUnicodeKeyboardEvent(rdpInput *, uint16_t, uint16_t);
+    friend class ::InputHandlerTest;
 
     /**
      * Called when the state of modifier keys changes.

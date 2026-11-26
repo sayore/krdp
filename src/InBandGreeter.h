@@ -45,6 +45,8 @@ public:
     int failedAttempts() const;
 
     void setScreenSize(const QSize &size);
+    void setKeyboardLayout(quint32 rdpKeyboardLayout);
+    void requestRedraw();
     void handleInputEvent(const std::shared_ptr<QInputEvent> &event);
 
     /**

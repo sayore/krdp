@@ -23,6 +23,11 @@ ecm_add_test(clipboardimagetest.cpp
     LINK_LIBRARIES KRdp Qt6::Test Qt6::Gui
 )
 
+ecm_add_test(inputhandlertest.cpp
+    TEST_NAME inputhandlertest
+    LINK_LIBRARIES KRdp Qt6::Test Qt6::Gui Qt6::Network XKB::XKB
+)
+
 ecm_add_test(vmconnectauthtest.cpp
     ../src/RdpConnection.cpp
     ../src/PeerContext.cpp
