@@ -71,10 +71,10 @@ index 2bba0e5..4f87f34 100644
 +target_compile_definitions(vmconnectauthtest PRIVATE KRDP_VMCONNECT_TEST_HARNESS KRDP_STATIC_DEFINE)
 diff --git a/autotests/audiostreamtest.cpp b/autotests/audiostreamtest.cpp
 new file mode 100644
-index 0000000..a59958a
+index 0000000..fd00317
 --- /dev/null
 +++ b/autotests/audiostreamtest.cpp
-@@ -0,0 +1,228 @@
+@@ -0,0 +1,255 @@
 +// SPDX-FileCopyrightText: 2026 Amelie Krippner <amykrippner@outlook.de>
 +// SPDX-License-Identifier: LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL
 +
@@ -90,6 +90,7 @@ index 0000000..a59958a
 +#include <unistd.h>
 +#include <vector>
 +
++#include "AudioInputStream.h"
 +#include "AudioStream.h"
 +#include "RdpConnection.h"
 +#include "Server.h"
@@ -294,10 +295,36 @@ index 0000000..a59958a
 +        QVERIFY(!conn.audioStream()->enabled());
 +        QVERIFY(!conn.audioStream()->activated());
 +
++        QVERIFY(!conn.audioInputStream()->initialize());
++        QVERIFY(!conn.audioInputStream()->enabled());
++        QVERIFY(!conn.audioInputStream()->capturing());
++
 +        conn.close();
 +        ::close(fds[1]);
 +        QTRY_COMPARE_WITH_TIMEOUT(conn.state(), KRdp::RdpConnection::State::Closed, 2000);
 +        server.stop();
++    }
++
++    void testAudioInputFormatSelection()
++    {
++        // Prefers 48kHz mono 16-bit PCM > 48kHz stereo > 44.1kHz mono > 16kHz mono; ignores ADPCM/8-bit
++        const std::array<AUDIO_FORMAT, 5> formats = {
++            makeFmt(WAVE_FORMAT_ADPCM, 1, 48000, 4),
++            makeFmt(WAVE_FORMAT_PCM, 1, 16000, 16),
++            makeFmt(WAVE_FORMAT_PCM, 2, 48000, 16),
++            makeFmt(WAVE_FORMAT_PCM, 1, 48000, 16),
++            makeFmt(WAVE_FORMAT_PCM, 1, 44100, 8),
++        };
++        const auto best = KRdp::AudioInputStream::selectBestClientFormat(formats.data(), static_cast<uint32_t>(formats.size()));
++        QVERIFY(best.has_value());
++        QCOMPARE(*best, uint32_t(3));
++
++        const std::array<AUDIO_FORMAT, 1> mono16k = {makeFmt(WAVE_FORMAT_PCM, 1, 16000, 16)};
++        const auto fallback = KRdp::AudioInputStream::selectBestClientFormat(mono16k.data(), 1);
++        QVERIFY(fallback.has_value());
++        QCOMPARE(*fallback, uint32_t(0));
++
++        QVERIFY(!KRdp::AudioInputStream::selectBestClientFormat(nullptr, 0).has_value());
 +    }
 +};
 +
@@ -889,10 +916,10 @@ index 0000000..61d8c99
 +#include "videostreamqualitytest.moc"
 diff --git a/autotests/vmconnectauthtest.cpp b/autotests/vmconnectauthtest.cpp
 new file mode 100644
-index 0000000..e142f19
+index 0000000..1b36ea9
 --- /dev/null
 +++ b/autotests/vmconnectauthtest.cpp
-@@ -0,0 +1,1643 @@
+@@ -0,0 +1,1645 @@
 +// SPDX-FileCopyrightText: 2026 FOXCORE Integration
 +// SPDX-License-Identifier: LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL
 +
@@ -919,6 +946,7 @@ index 0000000..e142f19
 +
 +#include <freerdp/codec/zgfx.h>
 +
++#include "AudioInputStream.h"
 +#include "AudioStream.h"
 +#include "Clipboard.h"
 +#include "InBandGreeter.h"
@@ -2030,6 +2058,7 @@ index 0000000..e142f19
 +        QCOMPARE(authSpy.count(), 0);
 +        QVERIFY(!conn.clipboard()->enabled());
 +        QVERIFY(!conn.audioStream()->enabled());
++        QVERIFY(!conn.audioInputStream()->enabled());
 +
 +        // Start greeter directly (simulating RDPGFX open) and verify frame rendering + auth controls
 +        auto *greeter = conn.inBandGreeter();
@@ -3157,10 +3186,10 @@ index 8fe524b..36696a1 100644
      });
 diff --git a/src/AudioStream.cpp b/src/AudioStream.cpp
 new file mode 100644
-index 0000000..93ecf18
+index 0000000..7cfeab6
 --- /dev/null
 +++ b/src/AudioStream.cpp
-@@ -0,0 +1,798 @@
+@@ -0,0 +1,802 @@
 +// SPDX-FileCopyrightText: 2026 Amelie Krippner <amykrippner@outlook.de>
 +//
 +// SPDX-License-Identifier: LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL
@@ -3539,7 +3568,7 @@ index 0000000..93ecf18
 +    ctx->server_formats = d->serverFormats.data();
 +    ctx->num_server_formats = d->serverFormats.size();
 +    ctx->src_format = &d->srcFormat;
-+    ctx->latency = 20;
++    ctx->latency = 15;
 +    ctx->Activated = Private::activatedCallback;
 +    ctx->ConfirmBlock = Private::confirmBlockCallback;
 +    ctx->ChannelIdAssigned = Private::channelIdAssignedCallback;
@@ -3738,10 +3767,14 @@ index 0000000..93ecf18
 +                                             "Remote Audio (RDP)",
 +                                             PW_KEY_NODE_NICK,
 +                                             "Remote Audio",
++                                             PW_KEY_DEVICE_CLASS,
++                                             "sound",
++                                             PW_KEY_DEVICE_FORM_FACTOR,
++                                             "speaker",
 +                                             PW_KEY_DEVICE_ICON_NAME,
 +                                             "audio-card",
 +                                             PW_KEY_NODE_VIRTUAL,
-+                                             "true",
++                                             "false",
 +                                             PW_KEY_PRIORITY_SESSION,
 +                                             "2000",
 +                                             PW_KEY_NODE_LATENCY,
@@ -3869,8 +3902,8 @@ index 0000000..93ecf18
 +{
 +    const auto startTime = std::chrono::steady_clock::now();
 +    constexpr int SilenceTailChunks = 40; // 400 ms tail at 10 ms/chunk
-+    constexpr int MaxInFlightBlocks = 5; // ~50 ms in-flight latency cap
-+    constexpr size_t MaxBufferedChunksBeforeTrim = 4; // trim stale backlog above ~40 ms
++    constexpr int MaxInFlightBlocks = 4; // ~40 ms in-flight latency cap
++    constexpr size_t MaxBufferedChunksBeforeTrim = 3; // trim stale backlog above ~30 ms
 +    int silentChunksRemaining = 0;
 +
 +    std::vector<int16_t> chunk(chunkSamples);
@@ -3894,9 +3927,9 @@ index 0000000..93ecf18
 +            continue;
 +        }
 +
-+        // Prevent permanent audio lag after transient spikes by trimming stale backlog down to ~20 ms.
++        // Prevent permanent audio lag after transient spikes (e.g. volume wheel chimes) by trimming stale backlog down to ~10 ms.
 +        if (avail > chunkSamples * MaxBufferedChunksBeforeTrim) {
-+            const size_t targetKeep = chunkSamples * 2;
++            const size_t targetKeep = chunkSamples;
 +            ringBuffer.discard(avail - targetKeep);
 +        }
 +
@@ -4053,13 +4086,15 @@ index 0000000..62a3259
 +
 +} // namespace KRdp
 diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
-index d50ac72..c2e5bce 100644
+index d50ac72..dd9b46f 100644
 --- a/src/CMakeLists.txt
 +++ b/src/CMakeLists.txt
-@@ -16,12 +16,16 @@ endif()
+@@ -16,12 +16,18 @@ endif()
  
  target_sources(KRdp PRIVATE
      AbstractSession.cpp
++    AudioInputStream.cpp
++    AudioInputStream.h
 +    AudioStream.cpp
 +    AudioStream.h
      Clipboard.cpp
@@ -4073,7 +4108,7 @@ index d50ac72..c2e5bce 100644
      RdpConnection.cpp
      Server.cpp
      Server.h
-@@ -62,6 +66,15 @@ target_sources(KRdp PRIVATE ${_dbus_sources})
+@@ -62,6 +68,15 @@ target_sources(KRdp PRIVATE ${_dbus_sources})
  
  target_include_directories(KRdp PUBLIC ${FreeRDP_INCLUDE_DIR} ${WinPR_INCLUDE_DIR} ${FreeRDP_Server_INCLUDE_DIR})
  
@@ -5862,7 +5897,7 @@ index 0b139e4..51831fb 100644
      /**
       * Called when the state of modifier keys changes.
 diff --git a/src/RdpConnection.cpp b/src/RdpConnection.cpp
-index 723b513..6f8e3e5 100644
+index 723b513..be1d413 100644
 --- a/src/RdpConnection.cpp
 +++ b/src/RdpConnection.cpp
 @@ -9,10 +9,21 @@
@@ -5887,13 +5922,14 @@ index 723b513..6f8e3e5 100644
  
  #include <QHostAddress>
  #include <QStandardPaths>
-@@ -25,11 +36,14 @@
+@@ -25,11 +36,15 @@
  #include <freerdp/server/cliprdr.h>
  
  #include <freerdp/channels/drdynvc.h>
 +#include <freerdp/channels/rdpsnd.h>
  
  #include "AbstractSession.h"
++#include "AudioInputStream.h"
 +#include "AudioStream.h"
  #include "Clipboard.h"
  #include "Cursor.h"
@@ -5902,7 +5938,7 @@ index 723b513..6f8e3e5 100644
  #include "InputHandler.h"
  #include "NetworkDetection.h"
  #include "PeerContext_p.h"
-@@ -67,6 +81,10 @@ static bool createSamFile(QTemporaryFile &file, const QList<User> &users)
+@@ -67,6 +82,10 @@ static bool createSamFile(QTemporaryFile &file, const QList<User> &users)
  
      for (const auto &user : users) {
          auto username = user.name.section(QLatin1Char('\\'), -1);
@@ -5913,7 +5949,7 @@ index 723b513..6f8e3e5 100644
          auto password = user.password.toUtf8();
  
          std::array<uint8_t, 16> hash;
-@@ -156,18 +174,34 @@ out_fail:
+@@ -156,18 +175,34 @@ out_fail:
  
  static int pamAuthenticate(const QString &user, const QString &password)
  {
@@ -5951,7 +5987,7 @@ index 723b513..6f8e3e5 100644
          return -1;
      }
  
-@@ -175,6 +209,7 @@ static int pamAuthenticate(const QString &user, const QString &password)
+@@ -175,6 +210,7 @@ static int pamAuthenticate(const QString &user, const QString &password)
  
      if (pam_status != PAM_SUCCESS) {
          qWarning() << "pam_authenticate failure:" << pam_strerror(info.handle, pam_status);
@@ -5959,7 +5995,7 @@ index 723b513..6f8e3e5 100644
          return -1;
      }
  
-@@ -182,9 +217,11 @@ static int pamAuthenticate(const QString &user, const QString &password)
+@@ -182,9 +218,11 @@ static int pamAuthenticate(const QString &user, const QString &password)
  
      if (pam_status != PAM_SUCCESS) {
          qWarning() << "pam_acct_mgmt failure:" << pam_strerror(info.handle, pam_status);
@@ -5971,7 +6007,7 @@ index 723b513..6f8e3e5 100644
      return 1;
  }
  
-@@ -242,12 +279,21 @@ class KRDP_NO_EXPORT RdpConnection::Private
+@@ -242,12 +280,22 @@ class KRDP_NO_EXPORT RdpConnection::Private
  public:
      Server *server = nullptr;
  
@@ -5990,11 +6026,12 @@ index 723b513..6f8e3e5 100644
  
      std::unique_ptr<InputHandler> inputHandler;
 +    std::unique_ptr<InBandGreeter> inBandGreeter;
++    std::unique_ptr<AudioInputStream> audioInputStream;
 +    std::unique_ptr<AudioStream> audioStream;
      std::unique_ptr<VideoStream> videoStream;
      std::unique_ptr<Cursor> cursor;
      std::unique_ptr<NetworkDetection> networkDetection;
-@@ -277,25 +323,73 @@ public:
+@@ -277,25 +325,74 @@ public:
  };
  
  RdpConnection::RdpConnection(Server *server, qintptr socketHandle)
@@ -6030,6 +6067,7 @@ index 723b513..6f8e3e5 100644
      d->networkDetection = std::make_unique<NetworkDetection>(this);
      d->clipboard = std::make_unique<Clipboard>(this);
 +    d->audioStream = std::make_unique<AudioStream>(this);
++    d->audioInputStream = std::make_unique<AudioInputStream>(this);
      d->displayControl = std::make_unique<DisplayControl>(this);
  
 +    connect(d->inputHandler.get(), &InputHandler::inputEvent, d->inBandGreeter.get(), [this](const std::shared_ptr<QInputEvent> &event) {
@@ -6069,7 +6107,7 @@ index 723b513..6f8e3e5 100644
      QMetaObject::invokeMethod(this, &RdpConnection::initialize, Qt::QueuedConnection);
  }
  
-@@ -308,7 +402,7 @@ RdpConnection::~RdpConnection()
+@@ -308,7 +405,7 @@ RdpConnection::~RdpConnection()
      if (d->thread.joinable()) {
          d->requestStop();
          d->thread.join();
@@ -6078,7 +6116,7 @@ index 723b513..6f8e3e5 100644
          // The run thread was never started (peer set up but initialize failed):
          // nothing else touches the peer, so close it here before freeing.
          d->peer->Close(d->peer);
-@@ -328,22 +422,150 @@ RdpConnection::~RdpConnection()
+@@ -328,22 +425,150 @@ RdpConnection::~RdpConnection()
  
  RdpConnection::State RdpConnection::state() const
  {
@@ -6233,7 +6271,7 @@ index 723b513..6f8e3e5 100644
          return;
      }
  
-@@ -382,6 +604,11 @@ Clipboard *RdpConnection::clipboard() const
+@@ -382,6 +607,16 @@ Clipboard *RdpConnection::clipboard() const
      return d->clipboard.get();
  }
  
@@ -6242,10 +6280,15 @@ index 723b513..6f8e3e5 100644
 +    return d->audioStream.get();
 +}
 +
++AudioInputStream *RdpConnection::audioInputStream() const
++{
++    return d->audioInputStream.get();
++}
++
  DisplayControl *RdpConnection::displayControl() const
  {
      return d->displayControl.get();
-@@ -392,16 +619,81 @@ NetworkDetection *RdpConnection::networkDetection() const
+@@ -392,16 +627,81 @@ NetworkDetection *RdpConnection::networkDetection() const
      return d->networkDetection.get();
  }
  
@@ -6327,7 +6370,7 @@ index 723b513..6f8e3e5 100644
      // Create an instance of our custom PeerContext extended context as context
      // rather than the plain rdpContext.
      d->peer->ContextSize = sizeof(PeerContext);
-@@ -411,6 +703,7 @@ void RdpConnection::initialize()
+@@ -411,6 +711,7 @@ void RdpConnection::initialize()
      auto result = freerdp_peer_context_new_ex(d->peer, d->server->rdpSettings());
      if (!result) {
          qCWarning(KRDP) << "Failed to create peer context";
@@ -6335,7 +6378,7 @@ index 723b513..6f8e3e5 100644
          return;
      }
  
-@@ -421,7 +714,7 @@ void RdpConnection::initialize()
+@@ -421,7 +722,7 @@ void RdpConnection::initialize()
  
      const bool usePamAuthentication = d->server->usePAMAuthentication();
  
@@ -6344,7 +6387,7 @@ index 723b513..6f8e3e5 100644
          if (!createSamFile(d->samFile, d->server->users())) {
              qFatal("Failed to create SAM database");
              return;
-@@ -436,6 +729,7 @@ void RdpConnection::initialize()
+@@ -436,6 +737,7 @@ void RdpConnection::initialize()
      auto certificate = freerdp_certificate_new_from_file(d->server->tlsCertificate().string().data());
      if (!certificate) {
          qCWarning(KRDP) << "Could not read certificate file" << d->server->tlsCertificate().string();
@@ -6352,7 +6395,7 @@ index 723b513..6f8e3e5 100644
          return;
      }
      freerdp_settings_set_pointer_len(settings, FreeRDP_RdpServerCertificate, certificate, 1);
-@@ -443,23 +737,40 @@ void RdpConnection::initialize()
+@@ -443,23 +745,41 @@ void RdpConnection::initialize()
      auto key = freerdp_key_new_from_file(d->server->tlsCertificateKey().string().data());
      if (!key) {
          qCWarning(KRDP) << "Could not read certificate file" << d->server->tlsCertificate().string();
@@ -6398,10 +6441,11 @@ index 723b513..6f8e3e5 100644
 -    // TODO: Implement audio support
 -    freerdp_settings_set_bool(settings, FreeRDP_AudioPlayback, false);
 +    freerdp_settings_set_bool(settings, FreeRDP_AudioPlayback, true);
++    freerdp_settings_set_bool(settings, FreeRDP_AudioCapture, true);
  
      freerdp_settings_set_uint32(settings, FreeRDP_ColorDepth, 32);
  
-@@ -475,6 +786,7 @@ void RdpConnection::initialize()
+@@ -475,6 +795,7 @@ void RdpConnection::initialize()
      freerdp_settings_set_bool(settings, FreeRDP_SupportDynamicChannels, true);
  
      freerdp_settings_set_bool(settings, FreeRDP_HasExtendedMouseEvent, true);
@@ -6409,7 +6453,7 @@ index 723b513..6f8e3e5 100644
      freerdp_settings_set_bool(settings, FreeRDP_HasHorizontalWheel, true);
      freerdp_settings_set_bool(settings, FreeRDP_UnicodeInput, true);
  
-@@ -482,7 +794,7 @@ void RdpConnection::initialize()
+@@ -482,7 +803,7 @@ void RdpConnection::initialize()
      freerdp_settings_set_bool(settings, FreeRDP_NetworkAutoDetect, true);
  
      freerdp_settings_set_bool(settings, FreeRDP_RefreshRect, true);
@@ -6418,7 +6462,7 @@ index 723b513..6f8e3e5 100644
      freerdp_settings_set_bool(settings, FreeRDP_RemoteFxCodec, false);
      freerdp_settings_set_bool(settings, FreeRDP_NSCodec, false);
      freerdp_settings_set_bool(settings, FreeRDP_FrameMarkerCommandEnabled, true);
-@@ -491,7 +803,6 @@ void RdpConnection::initialize()
+@@ -491,7 +812,6 @@ void RdpConnection::initialize()
      freerdp_settings_set_bool(settings, FreeRDP_SupportMonitorLayoutPdu, true);
      freerdp_settings_set_bool(settings, FreeRDP_SupportDisplayControl, true);
  
@@ -6426,15 +6470,16 @@ index 723b513..6f8e3e5 100644
      d->peer->Capabilities = peerCapabilities;
      d->peer->Activate = peerActivate;
      d->peer->PostConnect = peerPostConnect;
-@@ -526,6 +837,7 @@ void RdpConnection::run(std::stop_token stopToken)
+@@ -526,6 +846,8 @@ void RdpConnection::run(std::stop_token stopToken)
      auto channelEvent = WTSVirtualChannelManagerGetEventHandle(context->virtualChannelManager);
      BYTE lastDrdynvcState = 0xFF;
      bool lastDrdynvcJoined = false;
 +    bool audioInitAttempted = false;
++    bool audioInputInitAttempted = false;
      setState(State::Running);
  
      while (!stopToken.stop_requested()) {
-@@ -534,21 +846,26 @@ void RdpConnection::run(std::stop_token stopToken)
+@@ -534,21 +856,26 @@ void RdpConnection::run(std::stop_token stopToken)
          std::array<HANDLE, 33> events{channelEvent, d->stopEvent};
          auto handleCount = d->peer->GetEventHandles(d->peer, events.data() + 2, 31);
          if (handleCount <= 0) {
@@ -6464,7 +6509,7 @@ index 723b513..6f8e3e5 100644
              break;
          }
  
-@@ -556,45 +873,72 @@ void RdpConnection::run(std::stop_token stopToken)
+@@ -556,45 +883,80 @@ void RdpConnection::run(std::stop_token stopToken)
          const bool drdynvcJoined = WTSVirtualChannelManagerIsChannelJoined(context->virtualChannelManager, DRDYNVC_SVC_CHANNEL_NAME);
          const BYTE drdynvcState = WTSVirtualChannelManagerGetDrdynvcState(context->virtualChannelManager);
  
@@ -6510,6 +6555,14 @@ index 723b513..6f8e3e5 100644
 +            }
 +        }
 +
++        if (!audioInputInitAttempted && d->peer->connected && (state() == State::Activated || state() == State::Streaming) && isAuthenticated() && drdynvcJoined
++            && drdynvcState == DRDYNVC_STATE_READY) {
++            audioInputInitAttempted = true;
++            if (!d->audioInputStream->initialize()) {
++                qCInfo(KRDP) << "AUDIN microphone redirection not active (continuing without microphone)";
++            }
++        }
++
 +        if (d->peer->connected && state() == State::Activated && drdynvcJoined && drdynvcState == DRDYNVC_STATE_READY) {
              if (!d->displayControl->initialize()) {
 +                qCWarning(KRDP) << "RDP event loop exiting: display control initialization failed";
@@ -6543,7 +6596,7 @@ index 723b513..6f8e3e5 100644
                  }
              }
          }
-@@ -628,11 +972,17 @@ bool RdpConnection::onCapabilities()
+@@ -628,11 +990,17 @@ bool RdpConnection::onCapabilities()
          freerdp_settings_set_uint32(settings, FreeRDP_ColorDepth, 32);
      }
  
@@ -6562,7 +6615,7 @@ index 723b513..6f8e3e5 100644
      return true;
  }
  
-@@ -658,6 +1008,8 @@ static std::optional<quint8> qualitySeedForConnectionType(uint32_t connectionTyp
+@@ -658,6 +1026,8 @@ static std::optional<quint8> qualitySeedForConnectionType(uint32_t connectionTyp
  
  bool RdpConnection::onActivate()
  {
@@ -6571,7 +6624,7 @@ index 723b513..6f8e3e5 100644
      setState(State::Activated);
  
      if (!d->qualitySeeded) {
-@@ -681,49 +1033,80 @@ bool RdpConnection::onPostConnect()
+@@ -681,49 +1051,81 @@ bool RdpConnection::onPostConnect()
      qCInfo(KRDP) << "New client connected:" << d->peer->hostname << freerdp_peer_os_major_type_string(d->peer) << freerdp_peer_os_minor_type_string(d->peer);
  
      rdpSettings *settings = d->peer->context->settings;
@@ -6651,6 +6704,7 @@ index 723b513..6f8e3e5 100644
 +    QMetaObject::invokeMethod(d->inBandGreeter.get(), &InBandGreeter::stop, Qt::QueuedConnection);
      d->displayControl->close();
      d->clipboard->close();
++    d->audioInputStream->close();
 +    d->audioStream->close();
      d->videoStream->close();
 +    {
@@ -6669,10 +6723,10 @@ index 723b513..6f8e3e5 100644
          d->videoStream->setEnabled(true);
      } else {
 diff --git a/src/RdpConnection.h b/src/RdpConnection.h
-index 531b9f0..531481e 100644
+index 531b9f0..1673262 100644
 --- a/src/RdpConnection.h
 +++ b/src/RdpConnection.h
-@@ -11,13 +11,16 @@
+@@ -11,13 +11,17 @@
  
  #include <freerdp/freerdp.h>
  
@@ -6685,11 +6739,12 @@ index 531b9f0..531481e 100644
  class InputHandler;
 +class InBandGreeter;
  class Server;
++class AudioInputStream;
 +class AudioStream;
  class VideoStream;
  class VideoStreamSurface;
  class Cursor;
-@@ -61,6 +64,29 @@ public:
+@@ -61,6 +65,29 @@ public:
          VideoInitFailed, ///< VideoStream failed to initialize.
      };
  
@@ -6719,7 +6774,7 @@ index 531b9f0..531481e 100644
      /**
       * Constructor.
       *
-@@ -69,14 +95,41 @@ public:
+@@ -69,14 +96,41 @@ public:
       *                     for communication.
       */
      explicit RdpConnection(Server *server, qintptr socketHandle);
@@ -6761,24 +6816,27 @@ index 531b9f0..531481e 100644
      /**
       * Close the connection
       *
-@@ -100,6 +153,8 @@ public:
+@@ -100,6 +154,10 @@ public:
  
      Clipboard *clipboard() const;
  
 +    AudioStream *audioStream() const;
 +
++    AudioInputStream *audioInputStream() const;
++
      DisplayControl *displayControl() const;
  
      NetworkDetection *networkDetection() const;
-@@ -111,6 +166,7 @@ private:
+@@ -111,6 +169,8 @@ private:
      friend BOOL suppressOutput(rdpContext *, uint8_t, const RECTANGLE_16 *);
  
      friend class Cursor;
++    friend class AudioInputStream;
 +    friend class AudioStream;
      friend class VideoStream;
      friend class VideoStreamSurface;
      friend class NetworkDetection;
-@@ -118,6 +174,8 @@ private:
+@@ -118,6 +178,8 @@ private:
      friend class DisplayControl;
  
      void setState(State newState);
