@@ -1,5 +1,16 @@
 # KRdp
 
+> **Experimental Fork Notice (`foxcore/hyperv-vsock-enhanced-session`)**
+>
+> This branch is an **experimental** fork of [KDE/krdp](https://invent.kde.org/plasma/krdp) (GitHub mirror: [github.com/KDE/krdp](https://github.com/KDE/krdp)) adding native Linux `AF_VSOCK` (`hv_sock`), FreeRDP `VmConnectMode`, and an isolated in-band guest login greeter for **Microsoft Hyper-V Enhanced Session Mode** on KDE Plasma Wayland (without Xorg, XRDP, XFCE, autologin, or an exposed TCP port).
+>
+> - Full English documentation (architecture, installation, CLI, authentication, benchmarks, rollback, and Qualification Matrix): [`tools/foxcore/README.md`](tools/foxcore/README.md)
+> - Security model, trust boundary, and vulnerability reporting: [`SECURITY.md`](SECURITY.md)
+> - Interactive Windows Hyper-V host acceptance test plan (**currently UNVERIFIED / Release-Blocker**): [`tools/foxcore/tests/host-vmconnect-acceptance.md`](tools/foxcore/tests/host-vmconnect-acceptance.md)
+> - Standard TCP/TLS/NLA KRdp behavior below remains unchanged.
+
+---
+
 Library and examples for creating an RDP server.
 
 

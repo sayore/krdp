@@ -1,6 +1,44 @@
 # FOXCORE — Native KDE Plasma Wayland Hyper-V Enhanced Session Integration
 
-Native `AF_VSOCK` (`hv_sock`), Hyper-V `FreeRDP_VmConnectMode`, and an isolated in-band guest login greeter (`KRdp::InBandGreeter`) for KDE Plasma 6.8.3 (`KRdp`) on CachyOS — without Xorg, XRDP, XFCE, autologin, or an externally reachable TCP port.
+> **Project Status: Experimental**
+> Canonical Upstream: <https://invent.kde.org/plasma/krdp> · GitHub Upstream: <https://github.com/KDE/krdp>
+> Development Branch: `foxcore/hyperv-vsock-enhanced-session` · Security Policy: [`SECURITY.md`](../../SECURITY.md)
+
+Native `AF_VSOCK` (`hv_sock`), Hyper-V `FreeRDP_VmConnectMode`, and an isolated in-band guest login greeter (`KRdp::InBandGreeter`) for KDE Plasma 6.8.3 (`KRdp`) on Linux / CachyOS — without Xorg, XRDP, XFCE, autologin, or an externally reachable TCP port.
+
+---
+
+## 0. Architecture Overview
+
+```text
+Windows Hyper-V Host                         Linux Guest (KDE Plasma Wayland)
+────────────────────                         ────────────────────────────────
+vmconnect.exe / mstsc.exe
+  │  TLS / CredSSP (Host Auth)
+  ▼
+vmms.exe (TCP :2179, PCB EnhancedMode=1)
+  │  VMBus HvSocket (AF_VSOCK :3389, CID=2)
+  ▼
+KRdp::Server (--transport vsock --port 3389, zero TCP socket)
+  ├─ Verifies getpeername(): ss_family == AF_VSOCK && svm_cid == 2 (VMADDR_CID_HOST)
+  ├─ Enables FreeRDP_VmConnectMode + PROTOCOL_SSL + RestrictedAdminModeSupported
+  ▼
+KRdp::RdpConnection::onPostConnect()
+  ├─ Root / UID 0 user                     ──► REJECT & CLOSE immediately
+  ├─ Non-empty password in TS_INFO_PACKET  ──► PAM / KWallet check
+  │    ├─ Invalid                          ──► REJECT & CLOSE immediately
+  │    └─ Valid                            ──► AuthState::Authenticated
+  └─ Empty password (vmconnect.exe)        ──► AuthState::PendingInBandGreeter
+       │  (NO PipeWire, NO KWin EIS, NO Clipboard!)
+       ▼
+     KRdp::InBandGreeter (Progressive RFX QPainter UI, xkbcommon, 5-try lockout)
+       ├─ Root / Invalid / Timeout         ──► Cooldown (1s) / Close after 5 failures
+       └─ Valid Guest PAM/KWallet Login    ──► AuthState::Authenticated
+                                                 │
+                                                 ▼
+SessionController::onNewConnection() ──► Attaches PlasmaScreencastV1 / Portal
+                                         (PipeWire + KWin EIS + Clipboard + DisplayControl)
+```
 
 ---
 
