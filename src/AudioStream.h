@@ -23,11 +23,11 @@ namespace KRdp
 class RdpConnection;
 
 /**
- * Encapsulates an MS-RDPEA (RDPSND) audio output stream backed by native PipeWire capture.
+ * Encapsulates an MS-RDPEA (RDPSND) audio output stream backed by a native PipeWire virtual Audio/Sink.
  *
- * Captures desktop audio directly from the default PipeWire audio sink monitor
- * (PW_KEY_STREAM_CAPTURE_SINK = "true") without requiring PulseAudio client libraries,
- * and streams 16-bit PCM frames to the RDP client over AUDIO_PLAYBACK_DVC (preferred)
+ * Exposes a virtual PipeWire Audio/Sink ("Remote Audio (RDP)") visible in KDE Plasma's
+ * volume control without requiring PulseAudio client libraries, and streams 16-bit PCM
+ * frames directly via SNDC_WAVE2 (SendSamples2) over AUDIO_PLAYBACK_DVC (preferred)
  * or the static "rdpsnd" virtual channel.
  *
  * Strictly gated on RdpConnection::isAuthenticated() — never initialized while

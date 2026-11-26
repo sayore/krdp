@@ -213,6 +213,7 @@ public:
     std::atomic<bool> enabled{false};
     std::atomic<bool> activated{false};
     std::atomic<bool> closing{false};
+    std::atomic<uint16_t> selectedFormatIndex{0};
     std::atomic<int> inFlightBlocks{0};
     std::atomic<uint64_t> lastConfirmSteadyMs{0};
 
@@ -546,24 +547,32 @@ bool AudioStream::Private::startPipeWireCaptureLocked(uint32_t sampleRate, uint1
 
     pw_properties *props = pw_properties_new(PW_KEY_MEDIA_TYPE,
                                              "Audio",
-                                             PW_KEY_MEDIA_CATEGORY,
-                                             "Capture",
-                                             PW_KEY_MEDIA_ROLE,
-                                             "Screen",
-                                             PW_KEY_STREAM_CAPTURE_SINK,
-                                             "true",
+                                             PW_KEY_MEDIA_CLASS,
+                                             "Audio/Sink",
                                              PW_KEY_APP_NAME,
                                              "KRDP Server",
                                              PW_KEY_NODE_NAME,
-                                             "krdp-audio-capture",
+                                             "krdp-rdpsnd-sink",
+                                             PW_KEY_NODE_DESCRIPTION,
+                                             "Remote Audio (RDP)",
+                                             PW_KEY_NODE_NICK,
+                                             "Remote Audio",
+                                             PW_KEY_DEVICE_ICON_NAME,
+                                             "audio-card",
+                                             PW_KEY_NODE_VIRTUAL,
+                                             "true",
+                                             PW_KEY_PRIORITY_SESSION,
+                                             "2000",
                                              PW_KEY_NODE_LATENCY,
                                              latencySpec,
+                                             "monitor.channel-volumes",
+                                             "true",
                                              nullptr);
 
-    pwStream = pw_stream_new_simple(pw_thread_loop_get_loop(pwLoop), "krdp-audio-capture", props, &pwStreamEvents, this);
+    pwStream = pw_stream_new_simple(pw_thread_loop_get_loop(pwLoop), "Remote Audio (RDP)", props, &pwStreamEvents, this);
     if (!pwStream) {
         pw_thread_loop_unlock(pwLoop);
-        qCWarning(KRDP) << "RDPSND failed to create PipeWire capture stream";
+        qCWarning(KRDP) << "RDPSND failed to create PipeWire virtual Audio/Sink stream";
         stopPipeWireCaptureLocked();
         return false;
     }
@@ -583,7 +592,9 @@ bool AudioStream::Private::startPipeWireCaptureLocked(uint32_t sampleRate, uint1
     spa_pod_builder builder = SPA_POD_BUILDER_INIT(podBuf, sizeof(podBuf));
     const spa_pod *params[1] = {spa_format_audio_raw_build(&builder, SPA_PARAM_EnumFormat, &rawInfo)};
 
-    const auto flags = static_cast<pw_stream_flags>(PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS | PW_STREAM_FLAG_RT_PROCESS);
+    // Virtual Audio/Sink: WirePlumber automatically promotes it as default output sink
+    // (visible in KDE Plasma volume control) and routes desktop audio into this stream.
+    const auto flags = static_cast<pw_stream_flags>(PW_STREAM_FLAG_MAP_BUFFERS | PW_STREAM_FLAG_RT_PROCESS);
     const int rc = pw_stream_connect(pwStream, PW_DIRECTION_INPUT, PW_ID_ANY, flags, params, 1);
     pw_thread_loop_unlock(pwLoop);
 
@@ -593,7 +604,7 @@ bool AudioStream::Private::startPipeWireCaptureLocked(uint32_t sampleRate, uint1
         return false;
     }
 
-    qCInfo(KRDP) << "RDPSND PipeWire sink capture started:" << sampleRate << "Hz," << channels << "ch (" << framesPerChunk
+    qCInfo(KRDP) << "RDPSND PipeWire virtual Audio/Sink started:" << sampleRate << "Hz," << channels << "ch (" << framesPerChunk
                  << "frames/chunk, ringCapacity=" << ringBuffer.capacity() << "samples)";
     return true;
 }
@@ -642,6 +653,7 @@ void AudioStream::Private::onActivated(RdpsndServerContext *context)
             qCWarning(KRDP) << "RDPSND SelectFormat failed for index" << *selectedIdx << "status=" << status;
             return;
         }
+        selectedFormatIndex.store(*selectedIdx, std::memory_order_release);
     }
 
     activated.store(true, std::memory_order_release);
@@ -712,7 +724,8 @@ void AudioStream::Private::runTxLoop(std::stop_token stopToken, size_t chunkFram
 
         const auto nowSteady = std::chrono::steady_clock::now();
         const uint64_t nowMs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(nowSteady.time_since_epoch()).count());
-        const uint16_t wTimestamp = static_cast<uint16_t>(std::chrono::duration_cast<std::chrono::milliseconds>(nowSteady - startTime).count() & 0xFFFFu);
+        const uint32_t elapsedMs = static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(nowSteady - startTime).count());
+        const uint16_t wTimestamp = static_cast<uint16_t>(elapsedMs & 0xFFFFu);
 
         if (inFlightBlocks.load(std::memory_order_acquire) >= MaxInFlightBlocks) {
             const uint64_t lastConf = lastConfirmSteadyMs.load(std::memory_order_acquire);
@@ -726,10 +739,20 @@ void AudioStream::Private::runTxLoop(std::stop_token stopToken, size_t chunkFram
         UINT sendStatus = CHANNEL_RC_OK;
         {
             std::lock_guard lock(rdpsndMutex);
-            if (closing.load(std::memory_order_acquire) || !rdpsndContext || !rdpsndContext->SendSamples) {
+            if (closing.load(std::memory_order_acquire) || !rdpsndContext) {
                 break;
             }
-            sendStatus = rdpsndContext->SendSamples(rdpsndContext.get(), chunk.data(), chunkFrames, wTimestamp);
+            // Prefer SendSamples2 (SNDC_WAVE2) for raw S16LE PCM to send exact samples
+            // directly without routing through freerdp_dsp_encode() (which in FreeRDP 3.x
+            // corrupts signed 16-bit PCM by flipping the sign bit / offsetting by -32768).
+            if (rdpsndContext->clientVersion >= 8 && rdpsndContext->SendSamples2) {
+                const uint16_t fmtNo = selectedFormatIndex.load(std::memory_order_acquire);
+                sendStatus = rdpsndContext->SendSamples2(rdpsndContext.get(), fmtNo, chunk.data(), chunkSamples * sizeof(int16_t), wTimestamp, elapsedMs);
+            } else if (rdpsndContext->SendSamples) {
+                sendStatus = rdpsndContext->SendSamples(rdpsndContext.get(), chunk.data(), chunkFrames, wTimestamp);
+            } else {
+                break;
+            }
         }
 
         if (sendStatus != CHANNEL_RC_OK) {
