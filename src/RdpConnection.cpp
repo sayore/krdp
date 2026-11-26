@@ -9,10 +9,19 @@
 
 #include "RdpConnection.h"
 
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <optional>
 
 #include <fcntl.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#ifdef HAVE_LINUX_VM_SOCKETS_H
+#include <linux/vm_sockets.h>
+#endif
 
 #include <QHostAddress>
 #include <QStandardPaths>
@@ -67,6 +76,10 @@ static bool createSamFile(QTemporaryFile &file, const QList<User> &users)
 
     for (const auto &user : users) {
         auto username = user.name.section(QLatin1Char('\\'), -1);
+        if (RdpConnection::isDisallowedLoginUser(username) || user.password.isEmpty()) {
+            qCWarning(KRDP) << "Skipping disallowed or empty-password user in SAM file:" << username;
+            continue;
+        }
         auto password = user.password.toUtf8();
 
         std::array<uint8_t, 16> hash;
@@ -156,18 +169,34 @@ out_fail:
 
 static int pamAuthenticate(const QString &user, const QString &password)
 {
-    int pam_status = 0;
-    RdpConnectionPamHandle info = {0};
+    if (user.isEmpty() || password.isEmpty() || RdpConnection::isDisallowedLoginUser(user)) {
+        return -1;
+    }
 
-    info.appdata.user = user.toLatin1();
-    info.appdata.password = password.toLatin1();
+    int pam_status = 0;
+    RdpConnectionPamHandle info = {};
+
+    info.appdata.user = user.toUtf8();
+    info.appdata.password = password.toUtf8();
     info.pamc.conv = &pam_conv;
     info.pamc.appdata_ptr = &info.appdata;
+
+    auto cleanup = [&]() {
+        if (info.handle) {
+            pam_end(info.handle, pam_status);
+            info.handle = nullptr;
+        }
+        if (!info.appdata.password.isEmpty()) {
+            explicit_bzero(info.appdata.password.data(), static_cast<size_t>(info.appdata.password.size()));
+            info.appdata.password.clear();
+        }
+    };
 
     pam_status = pam_start("login", 0, &info.pamc, &info.handle);
 
     if (pam_status != PAM_SUCCESS) {
         qWarning() << "pam_start failure:" << pam_strerror(info.handle, pam_status);
+        cleanup();
         return -1;
     }
 
@@ -175,6 +204,7 @@ static int pamAuthenticate(const QString &user, const QString &password)
 
     if (pam_status != PAM_SUCCESS) {
         qWarning() << "pam_authenticate failure:" << pam_strerror(info.handle, pam_status);
+        cleanup();
         return -1;
     }
 
@@ -182,9 +212,11 @@ static int pamAuthenticate(const QString &user, const QString &password)
 
     if (pam_status != PAM_SUCCESS) {
         qWarning() << "pam_acct_mgmt failure:" << pam_strerror(info.handle, pam_status);
+        cleanup();
         return -1;
     }
 
+    cleanup();
     return 1;
 }
 
@@ -246,6 +278,7 @@ public:
     bool qualitySeeded = false;
 
     qintptr socketHandle;
+    TransportInfo transportInfo;
 
     std::unique_ptr<InputHandler> inputHandler;
     std::unique_ptr<VideoStream> videoStream;
@@ -277,11 +310,17 @@ public:
 };
 
 RdpConnection::RdpConnection(Server *server, qintptr socketHandle)
+    : RdpConnection(server, socketHandle, TransportInfo{})
+{
+}
+
+RdpConnection::RdpConnection(Server *server, qintptr socketHandle, const TransportInfo &transportInfo)
     : QObject(nullptr)
     , d(std::make_unique<Private>())
 {
     d->server = server;
     d->socketHandle = socketHandle;
+    d->transportInfo = transportInfo;
 
     d->inputHandler = std::make_unique<InputHandler>(this);
     d->videoStream = std::make_unique<VideoStream>(this);
@@ -392,14 +431,74 @@ NetworkDetection *RdpConnection::networkDetection() const
     return d->networkDetection.get();
 }
 
+bool RdpConnection::isDisallowedLoginUser(const QString &username)
+{
+    const QString normalized = username.section(QLatin1Char('\\'), -1).trimmed();
+    if (normalized.isEmpty()) {
+        return true;
+    }
+    if (normalized.compare(QStringLiteral("root"), Qt::CaseInsensitive) == 0) {
+        return true;
+    }
+    const KUser user(normalized);
+    if (user.isValid() && user.userId().nativeId() == 0) {
+        return true;
+    }
+    return false;
+}
+
 void RdpConnection::initialize()
 {
     setState(State::Starting);
 
+    if (d->transportInfo.vmConnectMode) {
+        bool verifiedVsockHostPeer = false;
+#ifdef HAVE_LINUX_VM_SOCKETS_H
+        if (d->transportInfo.transport == Server::Transport::Vsock && d->server->transport() == Server::Transport::Vsock && d->server->hyperVMode()) {
+            sockaddr_storage peerStorage{};
+            socklen_t peerLen = sizeof(peerStorage);
+            if (::getpeername(static_cast<int>(d->socketHandle), reinterpret_cast<sockaddr *>(&peerStorage), &peerLen) == 0 && peerStorage.ss_family == AF_VSOCK
+                && peerLen >= sizeof(sockaddr_vm)) {
+                const auto *peerVm = reinterpret_cast<const sockaddr_vm *>(&peerStorage);
+                if (peerVm->svm_cid == d->server->allowedVsockPeerCid()) {
+                    verifiedVsockHostPeer = true;
+                } else {
+                    qCWarning(KRDP) << "Refusing Hyper-V VMConnect mode for unauthorized AF_VSOCK peer CID" << peerVm->svm_cid << "(expected"
+                                    << d->server->allowedVsockPeerCid() << ")";
+                }
+            } else {
+                qCWarning(KRDP) << "Refusing Hyper-V VMConnect mode: peer socket is not a verified AF_VSOCK connection";
+            }
+        } else {
+            qCWarning(KRDP) << "Refusing Hyper-V VMConnect mode outside AF_VSOCK transport";
+        }
+#else
+        qCWarning(KRDP) << "Refusing Hyper-V VMConnect mode: built without AF_VSOCK support";
+#endif
+        if (!verifiedVsockHostPeer) {
+            if (d->socketHandle >= 0) {
+                ::close(static_cast<int>(d->socketHandle));
+                d->socketHandle = -1;
+            }
+            setState(State::Closed);
+            return;
+        }
+    }
+
     d->peer = freerdp_peer_new(d->socketHandle);
     if (!d->peer) {
         qCWarning(KRDP) << "Failed to create peer";
+        if (d->socketHandle >= 0) {
+            ::close(static_cast<int>(d->socketHandle));
+            d->socketHandle = -1;
+        }
+        setState(State::Closed);
         return;
+    }
+
+    if (d->transportInfo.transport == Server::Transport::Vsock) {
+        d->peer->local = TRUE;
+        std::snprintf(d->peer->hostname, sizeof(d->peer->hostname), "vsock://%u:%u", d->transportInfo.vsockPeerCid, d->transportInfo.vsockPeerPort);
     }
 
     // Create an instance of our custom PeerContext extended context as context
@@ -411,6 +510,7 @@ void RdpConnection::initialize()
     auto result = freerdp_peer_context_new_ex(d->peer, d->server->rdpSettings());
     if (!result) {
         qCWarning(KRDP) << "Failed to create peer context";
+        setState(State::Closed);
         return;
     }
 
@@ -421,7 +521,7 @@ void RdpConnection::initialize()
 
     const bool usePamAuthentication = d->server->usePAMAuthentication();
 
-    if (!usePamAuthentication) {
+    if (!usePamAuthentication && !d->transportInfo.vmConnectMode) {
         if (!createSamFile(d->samFile, d->server->users())) {
             qFatal("Failed to create SAM database");
             return;
@@ -436,6 +536,7 @@ void RdpConnection::initialize()
     auto certificate = freerdp_certificate_new_from_file(d->server->tlsCertificate().string().data());
     if (!certificate) {
         qCWarning(KRDP) << "Could not read certificate file" << d->server->tlsCertificate().string();
+        setState(State::Closed);
         return;
     }
     freerdp_settings_set_pointer_len(settings, FreeRDP_RdpServerCertificate, certificate, 1);
@@ -443,16 +544,34 @@ void RdpConnection::initialize()
     auto key = freerdp_key_new_from_file(d->server->tlsCertificateKey().string().data());
     if (!key) {
         qCWarning(KRDP) << "Could not read certificate file" << d->server->tlsCertificate().string();
+        setState(State::Closed);
         return;
     }
     freerdp_settings_set_pointer_len(settings, FreeRDP_RdpServerRsaKey, key, 1);
 
-    freerdp_settings_set_bool(settings, FreeRDP_RdpSecurity, false);
-    freerdp_settings_set_bool(settings, FreeRDP_TlsSecurity, usePamAuthentication);
-    freerdp_settings_set_bool(settings, FreeRDP_NlaSecurity, !usePamAuthentication);
-    freerdp_settings_set_bool(settings, FreeRDP_ExtSecurity, false);
-    // We do not implement RDSTLS, don't rely on FreeRDP's default for it
-    freerdp_settings_set_bool(settings, FreeRDP_RdstlsSecurity, false);
+    if (d->transportInfo.vmConnectMode) {
+        // Hyper-V Enhanced Session over HvSocket (AF_VSOCK, host CID 2):
+        // vmms.exe terminates TLS/CredSSP between vmconnect.exe and the host,
+        // then sends plaintext MCS Connect Initial immediately after RDP_NEG_RSP.
+        // Enable FreeRDP_VmConnectMode with PROTOCOL_SSL (not PROTOCOL_HYBRID,
+        // which would fail FreeRDP peer.c:831 when NLA is skipped) and enforce
+        // guest user authentication strictly in onPostConnect().
+        freerdp_settings_set_bool(settings, FreeRDP_VmConnectMode, true);
+        freerdp_settings_set_bool(settings, FreeRDP_RdpSecurity, false);
+        freerdp_settings_set_bool(settings, FreeRDP_TlsSecurity, true);
+        freerdp_settings_set_bool(settings, FreeRDP_NlaSecurity, false);
+        freerdp_settings_set_bool(settings, FreeRDP_ExtSecurity, false);
+        freerdp_settings_set_bool(settings, FreeRDP_RdstlsSecurity, false);
+        freerdp_settings_set_bool(settings, FreeRDP_RestrictedAdminModeSupported, true);
+    } else {
+        freerdp_settings_set_bool(settings, FreeRDP_VmConnectMode, false);
+        freerdp_settings_set_bool(settings, FreeRDP_RdpSecurity, false);
+        freerdp_settings_set_bool(settings, FreeRDP_TlsSecurity, usePamAuthentication);
+        freerdp_settings_set_bool(settings, FreeRDP_NlaSecurity, !usePamAuthentication);
+        freerdp_settings_set_bool(settings, FreeRDP_ExtSecurity, false);
+        // We do not implement RDSTLS, don't rely on FreeRDP's default for it
+        freerdp_settings_set_bool(settings, FreeRDP_RdstlsSecurity, false);
+    }
 
     freerdp_settings_set_uint32(settings, FreeRDP_OsMajorType, OSMAJORTYPE_UNIX);
     // PSEUDO_XSERVER is apparently required for things to work properly.
@@ -681,24 +800,40 @@ bool RdpConnection::onPostConnect()
     qCInfo(KRDP) << "New client connected:" << d->peer->hostname << freerdp_peer_os_major_type_string(d->peer) << freerdp_peer_os_minor_type_string(d->peer);
 
     rdpSettings *settings = d->peer->context->settings;
-    const QString username = QString::fromLatin1(freerdp_settings_get_string(settings, FreeRDP_Username)).section(QLatin1Char('\\'), -1);
+    const QString username = QString::fromUtf8(freerdp_settings_get_string(settings, FreeRDP_Username)).section(QLatin1Char('\\'), -1);
 
-    if (d->server->usePAMAuthentication()) {
+    if (!username.isEmpty() && isDisallowedLoginUser(username)) {
+        qCWarning(KRDP) << "Rejecting disallowed RDP login user:" << username;
+        return false;
+    }
+
+    const bool requirePostConnectAuth = d->server->usePAMAuthentication() || d->transportInfo.vmConnectMode;
+
+    if (requirePostConnectAuth) {
         if (!freerdp_settings_set_bool(settings, FreeRDP_AutoLogonEnabled, true)) {
             return false;
         }
 
-        const QString password = QString::fromLatin1(freerdp_settings_get_string(settings, FreeRDP_Password));
-        qCDebug(KRDP) << "Attempting authenticating user with PAM";
-        if (username == KUser().loginName() || KUser().loginName() == QStringLiteral("plasmalogin")) {
-            if (pamAuthenticate(username, password) >= 0) {
-                qCDebug(KRDP) << "PAM authentication succeeded for user" << username;
-                return true;
+        const QString password = QString::fromUtf8(freerdp_settings_get_string(settings, FreeRDP_Password));
+        if (username.isEmpty() || password.isEmpty()) {
+            qCWarning(KRDP) << "Rejecting unauthenticated RDP connection (missing username or password in TS_INFO_PACKET)"
+                            << (d->transportInfo.vmConnectMode ? "[Hyper-V VMConnect mode]" : "");
+            return false;
+        }
+
+        if (d->server->usePAMAuthentication()) {
+            qCDebug(KRDP) << "Attempting authenticating user with PAM";
+            if (username == KUser().loginName() || KUser().loginName() == QStringLiteral("plasmalogin")) {
+                if (pamAuthenticate(username, password) >= 0) {
+                    qCDebug(KRDP) << "PAM authentication succeeded for user" << username;
+                    return true;
+                }
             }
         }
+
         const auto users = d->server->users();
-        for (auto user : users) {
-            if (user.password.isEmpty()) {
+        for (const auto &user : users) {
+            if (user.password.isEmpty() || isDisallowedLoginUser(user.name)) {
                 continue;
             }
             if (user.name == username && user.password == password) {
@@ -706,9 +841,11 @@ bool RdpConnection::onPostConnect()
                 return true;
             }
         }
+        qCWarning(KRDP) << "Authentication failed for user" << username;
         return false;
     } else {
-        // In the NLA case the user has been authorised against the SAM database
+        // In the standard TCP NLA case, the user has been authorised against the SAM database
+        // (from which disallowed/root users are excluded).
         return true;
     }
 }

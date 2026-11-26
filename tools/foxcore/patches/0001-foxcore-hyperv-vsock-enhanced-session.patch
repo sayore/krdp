@@ -1,0 +1,1150 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 85a8c7a..bed441a 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -12,6 +12,8 @@ set(KDE_COMPILERSETTINGS_LEVEL "5.85")
+ project(KRdp VERSION "${PROJECT_VERSION}")
+ 
+ include(FeatureSummary)
++include(CheckIncludeFile)
++check_include_file("linux/vm_sockets.h" HAVE_LINUX_VM_SOCKETS_H)
+ find_package(ECM ${KF6_MIN_VERSION} NO_MODULE)
+ set_package_properties(ECM PROPERTIES TYPE REQUIRED DESCRIPTION "Extra CMake Modules." URL "https://commits.kde.org/extra-cmake-modules")
+ feature_summary(WHAT REQUIRED_PACKAGES_NOT_FOUND FATAL_ON_MISSING_REQUIRED_PACKAGES)
+diff --git a/autotests/CMakeLists.txt b/autotests/CMakeLists.txt
+index 2bba0e5..a82bef3 100644
+--- a/autotests/CMakeLists.txt
++++ b/autotests/CMakeLists.txt
+@@ -1,7 +1,14 @@
+ # SPDX-FileCopyrightText: 2026 Nicolas Fella <nicolas.fella@gmx.de>
+ # SPDX-License-Identifier: BSD-2-Clause
+ 
++find_package(Qt6 ${QT_MIN_VERSION} CONFIG REQUIRED Test)
++
+ add_test(NAME kcm_smoketest COMMAND kcmshell6 --smoke-test kcm_krdpserver)
+ set_tests_properties(kcm_smoketest PROPERTIES
+     ENVIRONMENT_MODIFICATION QT_PLUGIN_PATH=path_list_prepend:${CMAKE_BINARY_DIR}/bin
+ )
++
++ecm_add_test(vsocktransporttest.cpp
++    TEST_NAME vsocktransporttest
++    LINK_LIBRARIES KRdp Qt6::Test Qt6::Network
++)
+diff --git a/autotests/vsocktransporttest.cpp b/autotests/vsocktransporttest.cpp
+new file mode 100644
+index 0000000..2ae7dd4
+--- /dev/null
++++ b/autotests/vsocktransporttest.cpp
+@@ -0,0 +1,285 @@
++// SPDX-FileCopyrightText: 2026 FOXCORE Integration
++// SPDX-License-Identifier: LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL
++
++#include <QPointer>
++#include <QProcess>
++#include <QSignalSpy>
++#include <QTcpSocket>
++#include <QTemporaryDir>
++#include <QTest>
++
++#include <sys/socket.h>
++#include <unistd.h>
++
++#ifdef HAVE_LINUX_VM_SOCKETS_H
++#include <linux/vm_sockets.h>
++#endif
++
++#include <freerdp/freerdp.h>
++#include <freerdp/peer.h>
++
++#include "RdpConnection.h"
++#include "Server.h"
++
++class VsockTransportTest : public QObject
++{
++    Q_OBJECT
++
++private:
++    QTemporaryDir m_tempDir;
++    std::filesystem::path m_certPath;
++    std::filesystem::path m_keyPath;
++
++private Q_SLOTS:
++    void initTestCase()
++    {
++        QVERIFY(m_tempDir.isValid());
++        m_certPath = std::filesystem::path(m_tempDir.filePath(QStringLiteral("server.crt")).toStdString());
++        m_keyPath = std::filesystem::path(m_tempDir.filePath(QStringLiteral("server.key")).toStdString());
++
++        QProcess openssl;
++        openssl.start(QStringLiteral("openssl"),
++                      {
++                          QStringLiteral("req"),
++                          QStringLiteral("-x509"),
++                          QStringLiteral("-newkey"),
++                          QStringLiteral("rsa:2048"),
++                          QStringLiteral("-nodes"),
++                          QStringLiteral("-keyout"),
++                          QString::fromStdString(m_keyPath.string()),
++                          QStringLiteral("-out"),
++                          QString::fromStdString(m_certPath.string()),
++                          QStringLiteral("-days"),
++                          QStringLiteral("1"),
++                          QStringLiteral("-subj"),
++                          QStringLiteral("/CN=krdp-foxcore-test"),
++                      });
++        QVERIFY2(openssl.waitForFinished(15000), "openssl timed out");
++        QCOMPARE(openssl.exitCode(), 0);
++        QVERIFY(std::filesystem::exists(m_certPath));
++        QVERIFY(std::filesystem::exists(m_keyPath));
++    }
++
++    void testTcpRejectsHyperVMode()
++    {
++        KRdp::Server server;
++        server.setTransport(KRdp::Server::Transport::Tcp);
++        server.setHyperVMode(true);
++        server.setAddress(QHostAddress::LocalHost);
++        server.setPort(0);
++        server.setTlsCertificate(m_certPath);
++        server.setTlsCertificateKey(m_keyPath);
++
++        QVERIFY(!server.start());
++        QVERIFY(!server.isListeningTransport());
++    }
++
++    void testVsockRejectsWildcardPeerCid()
++    {
++#ifdef HAVE_LINUX_VM_SOCKETS_H
++        KRdp::Server server;
++        server.setTransport(KRdp::Server::Transport::Vsock);
++        server.setHyperVMode(true);
++        server.setPort(34388);
++        server.setAllowedVsockPeerCid(VMADDR_CID_ANY);
++        server.setTlsCertificate(m_certPath);
++        server.setTlsCertificateKey(m_keyPath);
++
++        QVERIFY(!server.start());
++        QVERIFY(!server.isListeningTransport());
++#else
++        QSKIP("Built without <linux/vm_sockets.h>");
++#endif
++    }
++
++    void testVsockListenHasNoTcpListener()
++    {
++#ifdef HAVE_LINUX_VM_SOCKETS_H
++        const int probe = ::socket(AF_VSOCK, SOCK_STREAM, 0);
++        if (probe < 0) {
++            QSKIP("AF_VSOCK not available in kernel");
++        }
++        ::close(probe);
++
++        KRdp::Server server;
++        server.setTransport(KRdp::Server::Transport::Vsock);
++        server.setHyperVMode(true);
++        server.setPort(34389);
++        server.setAllowedVsockPeerCid(VMADDR_CID_HOST);
++        server.setTlsCertificate(m_certPath);
++        server.setTlsCertificateKey(m_keyPath);
++
++        QVERIFY(server.start());
++        QVERIFY(server.isListeningTransport());
++        // QTcpServer must NOT be listening when transport is Vsock
++        QVERIFY(!server.isListening());
++
++        server.stop();
++        QVERIFY(!server.isListeningTransport());
++#else
++        QSKIP("Built without <linux/vm_sockets.h>");
++#endif
++    }
++
++    void testTcpStillEnforcesTlsHandshake()
++    {
++        KRdp::Server server;
++        server.setTransport(KRdp::Server::Transport::Tcp);
++        server.setHyperVMode(false);
++        server.setUsePAMAuthentication(true);
++        server.setAddress(QHostAddress::LocalHost);
++        server.setPort(0);
++        server.setTlsCertificate(m_certPath);
++        server.setTlsCertificateKey(m_keyPath);
++
++        QVERIFY(server.start());
++        QVERIFY(server.isListening());
++        QVERIFY(server.serverPort() != 0);
++
++        QSignalSpy connSpy(&server, &KRdp::Server::newConnectionCreated);
++
++        QTcpSocket client;
++        client.connectToHost(QHostAddress::LocalHost, server.serverPort());
++        QVERIFY(client.waitForConnected(3000));
++        QTRY_COMPARE(connSpy.count(), 1);
++
++        QPointer<KRdp::RdpConnection> conn(connSpy.takeFirst().at(0).value<KRdp::RdpConnection *>());
++        QVERIFY(!conn.isNull());
++
++        // Send standard X.224 CR-TPDU with RDP_NEG_REQ requesting SSL|HYBRID|HYBRID_EX (0x0b)
++        const QByteArray crTpdu = QByteArray::fromHex(
++            "03000013" // TPKT v3, len 19
++            "0ee00000000000" // X.224 CR-TPDU
++            "01000800" // RDP_NEG_REQ, flags=0, len=8
++            "0b000000"); // SSL|HYBRID|HYBRID_EX
++        QCOMPARE(client.write(crTpdu), crTpdu.size());
++        QVERIFY(client.waitForBytesWritten(3000));
++        QTRY_VERIFY_WITH_TIMEOUT(client.bytesAvailable() >= 19, 3000);
++
++        const QByteArray ccTpdu = client.readAll();
++        QVERIFY2(ccTpdu.size() >= 19, "Expected X.224 CC-TPDU with RDP_NEG_RSP");
++        // Verify TPKT v3 + X.224 CC (0xd0) + RDP_NEG_RSP (0x02) + SelectedProtocol == PROTOCOL_SSL (0x01)
++        QCOMPARE(static_cast<unsigned char>(ccTpdu[0]), 0x03u);
++        QCOMPARE(static_cast<unsigned char>(ccTpdu[5]), 0xd0u);
++        QCOMPARE(static_cast<unsigned char>(ccTpdu[11]), 0x02u);
++        QCOMPARE(static_cast<unsigned char>(ccTpdu[15]), 0x01u);
++
++        // Now send plaintext TPKT (what Hyper-V vmms sends, NOT a TLS ClientHello).
++        // Because this is TCP (not verified AF_VSOCK VMConnect), KRdp MUST enforce TLS and reject it!
++        const QByteArray plaintextTpkt = QByteArray::fromHex("0300001002f0807f6505040100040100");
++        QCOMPARE(client.write(plaintextTpkt), plaintextTpkt.size());
++        QVERIFY(client.waitForBytesWritten(3000));
++        QTRY_VERIFY_WITH_TIMEOUT(client.state() == QAbstractSocket::UnconnectedState, 3000);
++
++        // Server destroys the RdpConnection once it enters State::Closed
++        QTRY_VERIFY_WITH_TIMEOUT(conn.isNull(), 3000);
++        server.stop();
++    }
++
++    void testFreeRdpVmConnectNegotiationAndPlaintextMcs()
++    {
++        // Verify against the installed FreeRDP 3.33.1 library that our exact Hyper-V
++        // VMConnect settings negotiate PROTOCOL_SSL with RDP_NEG_REQ=0x0b, advertise
++        // RESTRICTED_ADMIN_MODE_SUPPORTED, skip the guest-side TLS handshake, and
++        // accept subsequent plaintext TPKT/MCS data instead of failing with
++        // tls_validate_record_header:wrong version number.
++        int fds[2] = {-1, -1};
++        QCOMPARE(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
++
++        freerdp_peer *peer = freerdp_peer_new(fds[0]);
++        QVERIFY(peer != nullptr);
++        QVERIFY(freerdp_peer_context_new(peer));
++
++        rdpSettings *settings = peer->context->settings;
++        auto *cert = freerdp_certificate_new_from_file(m_certPath.string().c_str());
++        auto *key = freerdp_key_new_from_file(m_keyPath.string().c_str());
++        QVERIFY(cert != nullptr);
++        QVERIFY(key != nullptr);
++        QVERIFY(freerdp_settings_set_pointer_len(settings, FreeRDP_RdpServerCertificate, cert, 1));
++        QVERIFY(freerdp_settings_set_pointer_len(settings, FreeRDP_RdpServerRsaKey, key, 1));
++
++        // Exact security profile applied by KRdp::RdpConnection::initialize() in VmConnectMode:
++        QVERIFY(freerdp_settings_set_bool(settings, FreeRDP_VmConnectMode, TRUE));
++        QVERIFY(freerdp_settings_set_bool(settings, FreeRDP_RdpSecurity, FALSE));
++        QVERIFY(freerdp_settings_set_bool(settings, FreeRDP_TlsSecurity, TRUE));
++        QVERIFY(freerdp_settings_set_bool(settings, FreeRDP_NlaSecurity, FALSE));
++        QVERIFY(freerdp_settings_set_bool(settings, FreeRDP_ExtSecurity, FALSE));
++        QVERIFY(freerdp_settings_set_bool(settings, FreeRDP_RdstlsSecurity, FALSE));
++        QVERIFY(freerdp_settings_set_bool(settings, FreeRDP_RestrictedAdminModeSupported, TRUE));
++        QVERIFY(freerdp_settings_set_bool(settings, FreeRDP_SupportGraphicsPipeline, TRUE));
++        QVERIFY(peer->Initialize(peer));
++
++        // 1. Send X.224 CR-TPDU with RDP_NEG_REQ = SSL|HYBRID|HYBRID_EX (0x0000000b)
++        const QByteArray crTpdu = QByteArray::fromHex(
++            "03000013"
++            "0ee00000000000"
++            "01000800"
++            "0b000000");
++        QCOMPARE(::send(fds[1], crTpdu.constData(), static_cast<size_t>(crTpdu.size()), 0), crTpdu.size());
++
++        // Drive server peer state machine through INITIAL -> NEGO -> MCS_CREATE_REQUEST
++        QVERIFY2(peer->CheckFileDescriptor(peer) == TRUE, "FreeRDP VmConnectMode negotiation failed");
++
++        // Read X.224 CC-TPDU response
++        char respBuf[64] = {};
++        const ssize_t n = ::recv(fds[1], respBuf, sizeof(respBuf), 0);
++        QVERIFY2(n >= 19, "Expected 19-byte X.224 CC-TPDU with RDP_NEG_RSP");
++        QCOMPARE(static_cast<unsigned char>(respBuf[0]), 0x03u); // TPKT v3
++        QCOMPARE(static_cast<unsigned char>(respBuf[5]), 0xd0u); // X.224 CC
++        QCOMPARE(static_cast<unsigned char>(respBuf[11]), 0x02u); // TYPE_RDP_NEG_RSP
++        // Flags must include EXTENDED_CLIENT_DATA_SUPPORTED (0x01), DYNVC_GFX_PROTOCOL_SUPPORTED (0x02),
++        // and RESTRICTED_ADMIN_MODE_SUPPORTED (0x08) -> 0x0b
++        QVERIFY((static_cast<unsigned char>(respBuf[12]) & 0x0bu) == 0x0bu);
++        QCOMPARE(static_cast<unsigned char>(respBuf[15]), 0x01u); // SelectedProtocol == PROTOCOL_SSL
++
++        // Verify peer authenticated and advanced past NEGO without attempting TLS handshake
++        QVERIFY(peer->authenticated == TRUE);
++        constexpr uint32_t ProtocolSsl = 0x00000001u;
++        QCOMPARE(freerdp_settings_get_uint32(settings, FreeRDP_SelectedProtocol), ProtocolSsl);
++        QCOMPARE(freerdp_settings_get_bool(settings, FreeRDP_UseRdpSecurityLayer), FALSE);
++
++        peer->Close(peer);
++        freerdp_peer_context_free(peer);
++        freerdp_peer_free(peer);
++        ::close(fds[1]);
++    }
++
++    void testVmConnectModeDefenseInDepthRejectsNonVsockFd()
++    {
++        KRdp::Server server;
++        server.setTransport(KRdp::Server::Transport::Tcp);
++        server.setAddress(QHostAddress::LocalHost);
++        server.setPort(0);
++        server.setTlsCertificate(m_certPath);
++        server.setTlsCertificateKey(m_keyPath);
++        QVERIFY(server.start());
++
++        int fds[2] = {-1, -1};
++        QCOMPARE(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
++
++        KRdp::RdpConnection::TransportInfo forgedInfo;
++        forgedInfo.transport = KRdp::Server::Transport::Vsock;
++        forgedInfo.vmConnectMode = true;
++        forgedInfo.vsockPeerCid = 2;
++        forgedInfo.vsockPeerPort = 12345;
++
++        KRdp::RdpConnection conn(&server, fds[0], forgedInfo);
++        QTRY_COMPARE(conn.state(), KRdp::RdpConnection::State::Closed);
++
++        ::close(fds[1]);
++        server.stop();
++    }
++
++    void testDisallowedRootUsers()
++    {
++        QVERIFY(KRdp::RdpConnection::isDisallowedLoginUser(QString()));
++        QVERIFY(KRdp::RdpConnection::isDisallowedLoginUser(QStringLiteral("root")));
++        QVERIFY(KRdp::RdpConnection::isDisallowedLoginUser(QStringLiteral("ROOT")));
++        QVERIFY(KRdp::RdpConnection::isDisallowedLoginUser(QStringLiteral("DOMAIN\\root")));
++        QVERIFY(KRdp::RdpConnection::isDisallowedLoginUser(QStringLiteral(".\\root")));
++        QVERIFY(!KRdp::RdpConnection::isDisallowedLoginUser(QStringLiteral("regularuser")));
++    }
++};
++
++QTEST_MAIN(VsockTransportTest)
++#include "vsocktransporttest.moc"
+diff --git a/server/main.cpp b/server/main.cpp
+index c5a2a91..e291f55 100644
+--- a/server/main.cpp
++++ b/server/main.cpp
+@@ -23,6 +23,17 @@
+ 
+ using namespace Qt::StringLiterals;
+ 
++static std::optional<KRdp::Server::Transport> parseTransport(QAnyStringView value)
++{
++    if (value == u"tcp"_s) {
++        return KRdp::Server::Transport::Tcp;
++    }
++    if (value == u"vsock"_s) {
++        return KRdp::Server::Transport::Vsock;
++    }
++    return std::nullopt;
++}
++
+ static std::optional<SessionController::OperationMode> parseOperationMode(QAnyStringView value)
+ {
+     if (value == u"RemoteAccess"_s) {
+@@ -58,6 +69,12 @@ int main(int argc, char **argv)
+         {{u"p"_s, u"password"_s}, u"The password to use for login. Requires username to be passed as well."_s, u"password"_s},
+         {u"address"_s, u"The address to listen on for connections. Defaults to 0.0.0.0"_s, u"address"_s},
+         {u"port"_s, u"The port to use for connections. Defaults to 3389."_s, u"port"_s, u"3389"_s},
++        {u"transport"_s, u"The transport to listen on: tcp (default) or vsock (Hyper-V Enhanced Session AF_VSOCK)."_s, u"transport"_s, u"tcp"_s},
++        {u"vmconnect"_s, u"Enable Hyper-V VMConnect mode (only valid with --transport vsock; enabled by default for vsock)."_s},
++        {u"no-vmconnect"_s, u"Disable Hyper-V VMConnect mode on --transport vsock and require full TLS/NLA."_s},
++        {u"vsock-cid"_s, u"The AF_VSOCK CID to bind to when using --transport vsock (numeric CID or 'any', default: any)."_s, u"cid"_s, u"any"_s},
++        {u"vsock-peer-cid"_s, u"The only AF_VSOCK peer CID permitted to connect (default: 2 / VMADDR_CID_HOST)."_s, u"cid"_s, u"2"_s},
++        {u"pam"_s, u"Enable PAM authentication for the current non-root user."_s},
+         {u"certificate"_s, u"The TLS certificate file to use."_s, u"certificate"_s, u"server.crt"_s},
+         {u"certificate-key"_s, u"The TLS certificate key to use."_s, u"certificate-key"_s, u"server.key"_s},
+         {u"monitor"_s, u"The index of the monitor to use when streaming."_s, u"monitor"_s, u"-1"_s},
+@@ -97,6 +114,23 @@ int main(int argc, char **argv)
+         }
+     };
+ 
++    const auto transport = parseTransport(parser.value(u"transport"_s).toLower());
++    if (!transport) {
++        qWarning() << "failed to parse transport" << parser.value(u"transport"_s) << ". Expected tcp or vsock";
++        return 1;
++    }
++
++    if (parser.isSet(u"vmconnect"_s) && parser.isSet(u"no-vmconnect"_s)) {
++        qWarning() << "--vmconnect and --no-vmconnect cannot be combined";
++        return 1;
++    }
++
++    const bool hyperVMode = (*transport == KRdp::Server::Transport::Vsock) ? !parser.isSet(u"no-vmconnect"_s) : parser.isSet(u"vmconnect"_s);
++    if (hyperVMode && *transport != KRdp::Server::Transport::Vsock) {
++        qWarning() << "--vmconnect is strictly restricted to --transport vsock and cannot be used with TCP";
++        return 1;
++    }
++
+     QHostAddress address = QHostAddress::Any;
+     if (parser.isSet(u"address"_s)) {
+         address = QHostAddress(parser.value(u"address"_s));
+@@ -107,6 +141,30 @@ int main(int argc, char **argv)
+ 
+     KRdp::Server server(nullptr);
+ 
++    server.setTransport(*transport);
++    server.setHyperVMode(hyperVMode);
++    if (*transport == KRdp::Server::Transport::Vsock) {
++        const QString bindCidStr = parser.value(u"vsock-cid"_s).trimmed().toLower();
++        if (bindCidStr != u"any"_s) {
++            bool ok = false;
++            const quint32 cid = bindCidStr.toUInt(&ok);
++            if (!ok) {
++                qWarning() << "failed to parse --vsock-cid" << bindCidStr << ". Expected numeric CID or 'any'";
++                return 1;
++            }
++            server.setVsockBindCid(cid);
++        }
++
++        const QString peerCidStr = parser.value(u"vsock-peer-cid"_s).trimmed().toLower();
++        bool peerOk = false;
++        const quint32 peerCid = peerCidStr.toUInt(&peerOk);
++        if (!peerOk || peerCid == 0xFFFFFFFFU) {
++            qWarning() << "invalid --vsock-peer-cid" << peerCidStr << ". Expected an explicit numeric CID (default: 2 / VMADDR_CID_HOST)";
++            return 1;
++        }
++        server.setAllowedVsockPeerCid(peerCid);
++    }
++
+     server.setAddress(address);
+     server.setPort(port);
+ 
+@@ -119,10 +177,13 @@ int main(int argc, char **argv)
+         user.name = parser.value(u"username"_s);
+         user.password = parser.value(u"password"_s);
+         server.addUser(user);
++        if (parser.isSet(u"pam"_s)) {
++            server.setUsePAMAuthentication(true);
++        }
+     }
+     // Otherwise use KCM username list
+     else {
+-        server.setUsePAMAuthentication(config->systemUserEnabled());
++        server.setUsePAMAuthentication(config->systemUserEnabled() || parser.isSet(u"pam"_s));
+ 
+         const auto users = config->users();
+         for (const auto &userName : users) {
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index d50ac72..9a23c03 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -62,6 +62,10 @@ target_sources(KRdp PRIVATE ${_dbus_sources})
+ 
+ target_include_directories(KRdp PUBLIC ${FreeRDP_INCLUDE_DIR} ${WinPR_INCLUDE_DIR} ${FreeRDP_Server_INCLUDE_DIR})
+ 
++if(HAVE_LINUX_VM_SOCKETS_H)
++    target_compile_definitions(KRdp PUBLIC HAVE_LINUX_VM_SOCKETS_H)
++endif()
++
+ target_link_libraries(KRdp PUBLIC
+     Qt::Core
+     Qt::Gui
+diff --git a/src/RdpConnection.cpp b/src/RdpConnection.cpp
+index 723b513..c516eb9 100644
+--- a/src/RdpConnection.cpp
++++ b/src/RdpConnection.cpp
+@@ -9,10 +9,19 @@
+ 
+ #include "RdpConnection.h"
+ 
++#include <cerrno>
++#include <cstdio>
++#include <cstring>
+ #include <filesystem>
+ #include <optional>
+ 
+ #include <fcntl.h>
++#include <sys/socket.h>
++#include <unistd.h>
++
++#ifdef HAVE_LINUX_VM_SOCKETS_H
++#include <linux/vm_sockets.h>
++#endif
+ 
+ #include <QHostAddress>
+ #include <QStandardPaths>
+@@ -67,6 +76,10 @@ static bool createSamFile(QTemporaryFile &file, const QList<User> &users)
+ 
+     for (const auto &user : users) {
+         auto username = user.name.section(QLatin1Char('\\'), -1);
++        if (RdpConnection::isDisallowedLoginUser(username) || user.password.isEmpty()) {
++            qCWarning(KRDP) << "Skipping disallowed or empty-password user in SAM file:" << username;
++            continue;
++        }
+         auto password = user.password.toUtf8();
+ 
+         std::array<uint8_t, 16> hash;
+@@ -156,18 +169,34 @@ out_fail:
+ 
+ static int pamAuthenticate(const QString &user, const QString &password)
+ {
++    if (user.isEmpty() || password.isEmpty() || RdpConnection::isDisallowedLoginUser(user)) {
++        return -1;
++    }
++
+     int pam_status = 0;
+-    RdpConnectionPamHandle info = {0};
++    RdpConnectionPamHandle info = {};
+ 
+-    info.appdata.user = user.toLatin1();
+-    info.appdata.password = password.toLatin1();
++    info.appdata.user = user.toUtf8();
++    info.appdata.password = password.toUtf8();
+     info.pamc.conv = &pam_conv;
+     info.pamc.appdata_ptr = &info.appdata;
+ 
++    auto cleanup = [&]() {
++        if (info.handle) {
++            pam_end(info.handle, pam_status);
++            info.handle = nullptr;
++        }
++        if (!info.appdata.password.isEmpty()) {
++            explicit_bzero(info.appdata.password.data(), static_cast<size_t>(info.appdata.password.size()));
++            info.appdata.password.clear();
++        }
++    };
++
+     pam_status = pam_start("login", 0, &info.pamc, &info.handle);
+ 
+     if (pam_status != PAM_SUCCESS) {
+         qWarning() << "pam_start failure:" << pam_strerror(info.handle, pam_status);
++        cleanup();
+         return -1;
+     }
+ 
+@@ -175,6 +204,7 @@ static int pamAuthenticate(const QString &user, const QString &password)
+ 
+     if (pam_status != PAM_SUCCESS) {
+         qWarning() << "pam_authenticate failure:" << pam_strerror(info.handle, pam_status);
++        cleanup();
+         return -1;
+     }
+ 
+@@ -182,9 +212,11 @@ static int pamAuthenticate(const QString &user, const QString &password)
+ 
+     if (pam_status != PAM_SUCCESS) {
+         qWarning() << "pam_acct_mgmt failure:" << pam_strerror(info.handle, pam_status);
++        cleanup();
+         return -1;
+     }
+ 
++    cleanup();
+     return 1;
+ }
+ 
+@@ -246,6 +278,7 @@ public:
+     bool qualitySeeded = false;
+ 
+     qintptr socketHandle;
++    TransportInfo transportInfo;
+ 
+     std::unique_ptr<InputHandler> inputHandler;
+     std::unique_ptr<VideoStream> videoStream;
+@@ -277,11 +310,17 @@ public:
+ };
+ 
+ RdpConnection::RdpConnection(Server *server, qintptr socketHandle)
++    : RdpConnection(server, socketHandle, TransportInfo{})
++{
++}
++
++RdpConnection::RdpConnection(Server *server, qintptr socketHandle, const TransportInfo &transportInfo)
+     : QObject(nullptr)
+     , d(std::make_unique<Private>())
+ {
+     d->server = server;
+     d->socketHandle = socketHandle;
++    d->transportInfo = transportInfo;
+ 
+     d->inputHandler = std::make_unique<InputHandler>(this);
+     d->videoStream = std::make_unique<VideoStream>(this);
+@@ -392,16 +431,76 @@ NetworkDetection *RdpConnection::networkDetection() const
+     return d->networkDetection.get();
+ }
+ 
++bool RdpConnection::isDisallowedLoginUser(const QString &username)
++{
++    const QString normalized = username.section(QLatin1Char('\\'), -1).trimmed();
++    if (normalized.isEmpty()) {
++        return true;
++    }
++    if (normalized.compare(QStringLiteral("root"), Qt::CaseInsensitive) == 0) {
++        return true;
++    }
++    const KUser user(normalized);
++    if (user.isValid() && user.userId().nativeId() == 0) {
++        return true;
++    }
++    return false;
++}
++
+ void RdpConnection::initialize()
+ {
+     setState(State::Starting);
+ 
++    if (d->transportInfo.vmConnectMode) {
++        bool verifiedVsockHostPeer = false;
++#ifdef HAVE_LINUX_VM_SOCKETS_H
++        if (d->transportInfo.transport == Server::Transport::Vsock && d->server->transport() == Server::Transport::Vsock && d->server->hyperVMode()) {
++            sockaddr_storage peerStorage{};
++            socklen_t peerLen = sizeof(peerStorage);
++            if (::getpeername(static_cast<int>(d->socketHandle), reinterpret_cast<sockaddr *>(&peerStorage), &peerLen) == 0 && peerStorage.ss_family == AF_VSOCK
++                && peerLen >= sizeof(sockaddr_vm)) {
++                const auto *peerVm = reinterpret_cast<const sockaddr_vm *>(&peerStorage);
++                if (peerVm->svm_cid == d->server->allowedVsockPeerCid()) {
++                    verifiedVsockHostPeer = true;
++                } else {
++                    qCWarning(KRDP) << "Refusing Hyper-V VMConnect mode for unauthorized AF_VSOCK peer CID" << peerVm->svm_cid << "(expected"
++                                    << d->server->allowedVsockPeerCid() << ")";
++                }
++            } else {
++                qCWarning(KRDP) << "Refusing Hyper-V VMConnect mode: peer socket is not a verified AF_VSOCK connection";
++            }
++        } else {
++            qCWarning(KRDP) << "Refusing Hyper-V VMConnect mode outside AF_VSOCK transport";
++        }
++#else
++        qCWarning(KRDP) << "Refusing Hyper-V VMConnect mode: built without AF_VSOCK support";
++#endif
++        if (!verifiedVsockHostPeer) {
++            if (d->socketHandle >= 0) {
++                ::close(static_cast<int>(d->socketHandle));
++                d->socketHandle = -1;
++            }
++            setState(State::Closed);
++            return;
++        }
++    }
++
+     d->peer = freerdp_peer_new(d->socketHandle);
+     if (!d->peer) {
+         qCWarning(KRDP) << "Failed to create peer";
++        if (d->socketHandle >= 0) {
++            ::close(static_cast<int>(d->socketHandle));
++            d->socketHandle = -1;
++        }
++        setState(State::Closed);
+         return;
+     }
+ 
++    if (d->transportInfo.transport == Server::Transport::Vsock) {
++        d->peer->local = TRUE;
++        std::snprintf(d->peer->hostname, sizeof(d->peer->hostname), "vsock://%u:%u", d->transportInfo.vsockPeerCid, d->transportInfo.vsockPeerPort);
++    }
++
+     // Create an instance of our custom PeerContext extended context as context
+     // rather than the plain rdpContext.
+     d->peer->ContextSize = sizeof(PeerContext);
+@@ -411,6 +510,7 @@ void RdpConnection::initialize()
+     auto result = freerdp_peer_context_new_ex(d->peer, d->server->rdpSettings());
+     if (!result) {
+         qCWarning(KRDP) << "Failed to create peer context";
++        setState(State::Closed);
+         return;
+     }
+ 
+@@ -421,7 +521,7 @@ void RdpConnection::initialize()
+ 
+     const bool usePamAuthentication = d->server->usePAMAuthentication();
+ 
+-    if (!usePamAuthentication) {
++    if (!usePamAuthentication && !d->transportInfo.vmConnectMode) {
+         if (!createSamFile(d->samFile, d->server->users())) {
+             qFatal("Failed to create SAM database");
+             return;
+@@ -436,6 +536,7 @@ void RdpConnection::initialize()
+     auto certificate = freerdp_certificate_new_from_file(d->server->tlsCertificate().string().data());
+     if (!certificate) {
+         qCWarning(KRDP) << "Could not read certificate file" << d->server->tlsCertificate().string();
++        setState(State::Closed);
+         return;
+     }
+     freerdp_settings_set_pointer_len(settings, FreeRDP_RdpServerCertificate, certificate, 1);
+@@ -443,16 +544,34 @@ void RdpConnection::initialize()
+     auto key = freerdp_key_new_from_file(d->server->tlsCertificateKey().string().data());
+     if (!key) {
+         qCWarning(KRDP) << "Could not read certificate file" << d->server->tlsCertificate().string();
++        setState(State::Closed);
+         return;
+     }
+     freerdp_settings_set_pointer_len(settings, FreeRDP_RdpServerRsaKey, key, 1);
+ 
+-    freerdp_settings_set_bool(settings, FreeRDP_RdpSecurity, false);
+-    freerdp_settings_set_bool(settings, FreeRDP_TlsSecurity, usePamAuthentication);
+-    freerdp_settings_set_bool(settings, FreeRDP_NlaSecurity, !usePamAuthentication);
+-    freerdp_settings_set_bool(settings, FreeRDP_ExtSecurity, false);
+-    // We do not implement RDSTLS, don't rely on FreeRDP's default for it
+-    freerdp_settings_set_bool(settings, FreeRDP_RdstlsSecurity, false);
++    if (d->transportInfo.vmConnectMode) {
++        // Hyper-V Enhanced Session over HvSocket (AF_VSOCK, host CID 2):
++        // vmms.exe terminates TLS/CredSSP between vmconnect.exe and the host,
++        // then sends plaintext MCS Connect Initial immediately after RDP_NEG_RSP.
++        // Enable FreeRDP_VmConnectMode with PROTOCOL_SSL (not PROTOCOL_HYBRID,
++        // which would fail FreeRDP peer.c:831 when NLA is skipped) and enforce
++        // guest user authentication strictly in onPostConnect().
++        freerdp_settings_set_bool(settings, FreeRDP_VmConnectMode, true);
++        freerdp_settings_set_bool(settings, FreeRDP_RdpSecurity, false);
++        freerdp_settings_set_bool(settings, FreeRDP_TlsSecurity, true);
++        freerdp_settings_set_bool(settings, FreeRDP_NlaSecurity, false);
++        freerdp_settings_set_bool(settings, FreeRDP_ExtSecurity, false);
++        freerdp_settings_set_bool(settings, FreeRDP_RdstlsSecurity, false);
++        freerdp_settings_set_bool(settings, FreeRDP_RestrictedAdminModeSupported, true);
++    } else {
++        freerdp_settings_set_bool(settings, FreeRDP_VmConnectMode, false);
++        freerdp_settings_set_bool(settings, FreeRDP_RdpSecurity, false);
++        freerdp_settings_set_bool(settings, FreeRDP_TlsSecurity, usePamAuthentication);
++        freerdp_settings_set_bool(settings, FreeRDP_NlaSecurity, !usePamAuthentication);
++        freerdp_settings_set_bool(settings, FreeRDP_ExtSecurity, false);
++        // We do not implement RDSTLS, don't rely on FreeRDP's default for it
++        freerdp_settings_set_bool(settings, FreeRDP_RdstlsSecurity, false);
++    }
+ 
+     freerdp_settings_set_uint32(settings, FreeRDP_OsMajorType, OSMAJORTYPE_UNIX);
+     // PSEUDO_XSERVER is apparently required for things to work properly.
+@@ -681,24 +800,40 @@ bool RdpConnection::onPostConnect()
+     qCInfo(KRDP) << "New client connected:" << d->peer->hostname << freerdp_peer_os_major_type_string(d->peer) << freerdp_peer_os_minor_type_string(d->peer);
+ 
+     rdpSettings *settings = d->peer->context->settings;
+-    const QString username = QString::fromLatin1(freerdp_settings_get_string(settings, FreeRDP_Username)).section(QLatin1Char('\\'), -1);
++    const QString username = QString::fromUtf8(freerdp_settings_get_string(settings, FreeRDP_Username)).section(QLatin1Char('\\'), -1);
++
++    if (!username.isEmpty() && isDisallowedLoginUser(username)) {
++        qCWarning(KRDP) << "Rejecting disallowed RDP login user:" << username;
++        return false;
++    }
++
++    const bool requirePostConnectAuth = d->server->usePAMAuthentication() || d->transportInfo.vmConnectMode;
+ 
+-    if (d->server->usePAMAuthentication()) {
++    if (requirePostConnectAuth) {
+         if (!freerdp_settings_set_bool(settings, FreeRDP_AutoLogonEnabled, true)) {
+             return false;
+         }
+ 
+-        const QString password = QString::fromLatin1(freerdp_settings_get_string(settings, FreeRDP_Password));
+-        qCDebug(KRDP) << "Attempting authenticating user with PAM";
+-        if (username == KUser().loginName() || KUser().loginName() == QStringLiteral("plasmalogin")) {
+-            if (pamAuthenticate(username, password) >= 0) {
+-                qCDebug(KRDP) << "PAM authentication succeeded for user" << username;
+-                return true;
++        const QString password = QString::fromUtf8(freerdp_settings_get_string(settings, FreeRDP_Password));
++        if (username.isEmpty() || password.isEmpty()) {
++            qCWarning(KRDP) << "Rejecting unauthenticated RDP connection (missing username or password in TS_INFO_PACKET)"
++                            << (d->transportInfo.vmConnectMode ? "[Hyper-V VMConnect mode]" : "");
++            return false;
++        }
++
++        if (d->server->usePAMAuthentication()) {
++            qCDebug(KRDP) << "Attempting authenticating user with PAM";
++            if (username == KUser().loginName() || KUser().loginName() == QStringLiteral("plasmalogin")) {
++                if (pamAuthenticate(username, password) >= 0) {
++                    qCDebug(KRDP) << "PAM authentication succeeded for user" << username;
++                    return true;
++                }
+             }
+         }
++
+         const auto users = d->server->users();
+-        for (auto user : users) {
+-            if (user.password.isEmpty()) {
++        for (const auto &user : users) {
++            if (user.password.isEmpty() || isDisallowedLoginUser(user.name)) {
+                 continue;
+             }
+             if (user.name == username && user.password == password) {
+@@ -706,9 +841,11 @@ bool RdpConnection::onPostConnect()
+                 return true;
+             }
+         }
++        qCWarning(KRDP) << "Authentication failed for user" << username;
+         return false;
+     } else {
+-        // In the NLA case the user has been authorised against the SAM database
++        // In the standard TCP NLA case, the user has been authorised against the SAM database
++        // (from which disallowed/root users are excluded).
+         return true;
+     }
+ }
+diff --git a/src/RdpConnection.h b/src/RdpConnection.h
+index 531b9f0..de9eb79 100644
+--- a/src/RdpConnection.h
++++ b/src/RdpConnection.h
+@@ -11,6 +11,7 @@
+ 
+ #include <freerdp/freerdp.h>
+ 
++#include "Server.h"
+ #include "krdp_export.h"
+ 
+ namespace KRdp
+@@ -61,6 +62,16 @@ public:
+         VideoInitFailed, ///< VideoStream failed to initialize.
+     };
+ 
++    /**
++     * Transport metadata for an accepted connection.
++     */
++    struct TransportInfo {
++        Server::Transport transport = Server::Transport::Tcp;
++        bool vmConnectMode = false;
++        quint32 vsockPeerCid = 0;
++        quint32 vsockPeerPort = 0;
++    };
++
+     /**
+      * Constructor.
+      *
+@@ -69,8 +80,14 @@ public:
+      *                     for communication.
+      */
+     explicit RdpConnection(Server *server, qintptr socketHandle);
++    explicit RdpConnection(Server *server, qintptr socketHandle, const TransportInfo &transportInfo);
+     ~RdpConnection() override;
+ 
++    /**
++     * Returns whether a username refers to root / UID 0 and must be rejected for RDP login.
++     */
++    static bool isDisallowedLoginUser(const QString &username);
++
+     /**
+      * The current session state.
+      */
+diff --git a/src/Server.cpp b/src/Server.cpp
+index 4ccb3ba..6539a12 100644
+--- a/src/Server.cpp
++++ b/src/Server.cpp
+@@ -4,9 +4,18 @@
+ 
+ #include "Server.h"
+ 
++#include <cerrno>
++#include <cstring>
+ #include <vector>
+ 
+ #include <QCoreApplication>
++#include <QSocketNotifier>
++
++#ifdef HAVE_LINUX_VM_SOCKETS_H
++#include <linux/vm_sockets.h>
++#include <sys/socket.h>
++#include <unistd.h>
++#endif
+ 
+ #include <freerdp/channels/channels.h>
+ #include <freerdp/freerdp.h>
+@@ -18,12 +27,30 @@
+ 
+ using namespace KRdp;
+ 
++namespace
++{
++#ifdef HAVE_LINUX_VM_SOCKETS_H
++constexpr quint32 DefaultVsockBindCid = VMADDR_CID_ANY;
++constexpr quint32 DefaultVsockPeerCid = VMADDR_CID_HOST;
++#else
++constexpr quint32 DefaultVsockBindCid = 0xFFFFFFFFU;
++constexpr quint32 DefaultVsockPeerCid = 2U;
++#endif
++}
++
+ class KRDP_NO_EXPORT Server::Private
+ {
+ public:
+     std::vector<std::unique_ptr<RdpConnection>> sessions;
+     rdp_settings *settings = nullptr;
+ 
++    Transport transport = Transport::Tcp;
++    bool hyperVMode = false;
++    quint32 vsockBindCid = DefaultVsockBindCid;
++    quint32 allowedVsockPeerCid = DefaultVsockPeerCid;
++    int vsockFd = -1;
++    std::unique_ptr<QSocketNotifier> vsockNotifier;
++
+     QHostAddress address = QHostAddress::LocalHost;
+     quint16 port = 3389;
+ 
+@@ -55,10 +82,122 @@ bool Server::start()
+         return false;
+     }
+ 
+-    if (!listen(d->address, d->port)) {
+-        // NOTE: We cannot use QTcpServer methods to get the server address and port because it won't initialize them if listen fails.
+-        qCCritical(KRDP) << "Unable to listen for connections on" << d->address << d->port;
++    if (d->transport == Transport::Tcp) {
++        if (d->hyperVMode) {
++            qCCritical(KRDP) << "Hyper-V VMConnect mode is strictly restricted to AF_VSOCK transport and cannot be enabled on TCP";
++            return false;
++        }
++
++        if (!listen(d->address, d->port)) {
++            // NOTE: We cannot use QTcpServer methods to get the server address and port because it won't initialize them if listen fails.
++            qCCritical(KRDP) << "Unable to listen for connections on" << d->address << d->port;
++            return false;
++        }
++    } else if (d->transport == Transport::Vsock) {
++#ifdef HAVE_LINUX_VM_SOCKETS_H
++        if (d->allowedVsockPeerCid == VMADDR_CID_ANY) {
++            qCCritical(KRDP) << "Refusing to start AF_VSOCK listener with wildcard peer CID (VMADDR_CID_ANY)";
++            return false;
++        }
++
++        const int fd = ::socket(AF_VSOCK, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
++        if (fd < 0) {
++            qCCritical(KRDP) << "Unable to create AF_VSOCK socket:" << std::strerror(errno);
++            return false;
++        }
++
++        const int reuse = 1;
++        if (::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
++            qCWarning(KRDP) << "setsockopt(SO_REUSEADDR) on AF_VSOCK socket failed:" << std::strerror(errno);
++        }
++
++        sockaddr_vm addr{};
++        addr.svm_family = AF_VSOCK;
++        addr.svm_cid = d->vsockBindCid;
++        addr.svm_port = d->port;
++
++        if (::bind(fd, reinterpret_cast<const sockaddr *>(&addr), sizeof(addr)) < 0) {
++            qCCritical(KRDP) << "Unable to bind AF_VSOCK socket on cid" << d->vsockBindCid << "port" << d->port << ":" << std::strerror(errno);
++            ::close(fd);
++            return false;
++        }
++
++        if (::listen(fd, 16) < 0) {
++            qCCritical(KRDP) << "Unable to listen on AF_VSOCK socket on cid" << d->vsockBindCid << "port" << d->port << ":" << std::strerror(errno);
++            ::close(fd);
++            return false;
++        }
++
++        d->vsockFd = fd;
++        d->vsockNotifier = std::make_unique<QSocketNotifier>(d->vsockFd, QSocketNotifier::Read, this);
++        connect(d->vsockNotifier.get(), &QSocketNotifier::activated, this, [this]() {
++            while (d->vsockFd >= 0) {
++                sockaddr_vm peerAddr{};
++                socklen_t peerLen = sizeof(peerAddr);
++                const int clientFd = ::accept4(d->vsockFd, reinterpret_cast<sockaddr *>(&peerAddr), &peerLen, SOCK_CLOEXEC);
++                if (clientFd < 0) {
++                    if (errno == EAGAIN
++#if defined(EWOULDBLOCK) && EWOULDBLOCK != EAGAIN
++                        || errno == EWOULDBLOCK
++#endif
++                    ) {
++                        break;
++                    }
++                    if (errno == EINTR) {
++                        continue;
++                    }
++                    qCWarning(KRDP) << "accept4() on AF_VSOCK failed:" << std::strerror(errno);
++                    break;
++                }
++
++                if (peerLen < sizeof(sockaddr_vm) || peerAddr.svm_family != AF_VSOCK) {
++                    qCWarning(KRDP) << "Rejecting non-AF_VSOCK peer on AF_VSOCK listener (family" << peerAddr.svm_family << ")";
++                    ::close(clientFd);
++                    continue;
++                }
++
++                if (peerAddr.svm_cid != d->allowedVsockPeerCid) {
++                    qCWarning(KRDP) << "Rejecting unauthorized AF_VSOCK peer CID" << peerAddr.svm_cid << "(expected" << d->allowedVsockPeerCid << ")";
++                    ::close(clientFd);
++                    continue;
++                }
++
++                qCInfo(KRDP) << "Accepted AF_VSOCK connection from CID" << peerAddr.svm_cid << "port" << peerAddr.svm_port
++                             << (d->hyperVMode ? "(Hyper-V VMConnect mode)" : "(standard TLS/NLA mode)");
++
++                RdpConnection::TransportInfo info;
++                info.transport = Transport::Vsock;
++                info.vmConnectMode = d->hyperVMode;
++                info.vsockPeerCid = peerAddr.svm_cid;
++                info.vsockPeerPort = peerAddr.svm_port;
++
++                auto session = std::make_unique<RdpConnection>(this, clientFd, info);
++                auto sessionPtr = session.get();
++                connect(
++                    sessionPtr,
++                    &RdpConnection::stateChanged,
++                    this,
++                    [this, sessionPtr](RdpConnection::State state) {
++                        if (state == RdpConnection::State::Closed) {
++                            auto itr = std::find_if(d->sessions.begin(), d->sessions.end(), [sessionPtr](auto &session) {
++                                return session.get() == sessionPtr;
++                            });
++                            if (itr == d->sessions.end()) {
++                                return;
++                            }
++                            auto session = std::move(*itr);
++                            d->sessions.erase(itr);
++                        }
++                    },
++                    Qt::QueuedConnection);
++                d->sessions.push_back(std::move(session));
++                Q_EMIT newConnectionCreated(sessionPtr);
++            }
++        });
++#else
++        qCCritical(KRDP) << "AF_VSOCK transport requested, but KRdp was built without <linux/vm_sockets.h>";
+         return false;
++#endif
+     }
+ 
+     // FreeRDP3 tries to use a global instance of the settings object when
+@@ -66,12 +205,28 @@ bool Server::start()
+     // global default instance. So create one here and use that.
+     d->settings = freerdp_settings_new(FREERDP_SETTINGS_SERVER_MODE);
+ 
+-    qCDebug(KRDP) << "Listening for connections on" << serverAddress() << serverPort();
++    if (d->transport == Transport::Vsock) {
++        qCInfo(KRDP) << "Listening for AF_VSOCK connections on cid" << d->vsockBindCid << "port" << d->port << "allowedPeerCid" << d->allowedVsockPeerCid
++                     << "hyperVMode" << d->hyperVMode;
++    } else {
++        qCDebug(KRDP) << "Listening for connections on" << serverAddress() << serverPort();
++    }
+     return true;
+ }
+ 
+ void Server::stop()
+ {
++    if (d->vsockNotifier) {
++        d->vsockNotifier->setEnabled(false);
++        d->vsockNotifier.reset();
++    }
++#ifdef HAVE_LINUX_VM_SOCKETS_H
++    if (d->vsockFd >= 0) {
++        ::close(d->vsockFd);
++        d->vsockFd = -1;
++    }
++#endif
++
+     close();
+ 
+     if (d->settings) {
+@@ -80,6 +235,54 @@ void Server::stop()
+     }
+ }
+ 
++Server::Transport Server::transport() const
++{
++    return d->transport;
++}
++
++void Server::setTransport(Transport newTransport)
++{
++    d->transport = newTransport;
++}
++
++bool Server::hyperVMode() const
++{
++    return d->hyperVMode;
++}
++
++void Server::setHyperVMode(bool enabled)
++{
++    d->hyperVMode = enabled;
++}
++
++quint32 Server::vsockBindCid() const
++{
++    return d->vsockBindCid;
++}
++
++void Server::setVsockBindCid(quint32 cid)
++{
++    d->vsockBindCid = cid;
++}
++
++quint32 Server::allowedVsockPeerCid() const
++{
++    return d->allowedVsockPeerCid;
++}
++
++void Server::setAllowedVsockPeerCid(quint32 cid)
++{
++    d->allowedVsockPeerCid = cid;
++}
++
++bool Server::isListeningTransport() const
++{
++    if (d->transport == Transport::Vsock) {
++        return d->vsockFd >= 0;
++    }
++    return isListening();
++}
++
+ QHostAddress Server::address() const
+ {
+     return d->address;
+diff --git a/src/Server.h b/src/Server.h
+index 5fcd298..e136cbe 100644
+--- a/src/Server.h
++++ b/src/Server.h
+@@ -39,13 +39,19 @@ class KRDP_EXPORT Server : public QTcpServer
+     Q_OBJECT
+ 
+ public:
++    enum class Transport {
++        Tcp,
++        Vsock,
++    };
++    Q_ENUM(Transport)
++
+     explicit Server(QObject *parent = nullptr);
+     ~Server() override;
+ 
+     /**
+      * Start listening for incoming connections.
+      *
+-     * Note that `address` and `port` should be set before calling this,
++     * Note that `transport`, `address`, and `port` should be set before calling this,
+      * changing them after the server has started listening has no effect.
+      */
+     bool start();
+@@ -54,6 +60,46 @@ public:
+      */
+     void stop();
+ 
++    /**
++     * The transport used to accept incoming RDP connections.
++     *
++     * Defaults to Transport::Tcp.
++     */
++    Transport transport() const;
++    void setTransport(Transport newTransport);
++
++    /**
++     * Whether Hyper-V VMConnect mode (FreeRDP_VmConnectMode) is enabled.
++     *
++     * This capability is strictly restricted to Transport::Vsock connections
++     * from the authorized Hyper-V host peer CID. Enabling it on Transport::Tcp
++     * causes start() to fail.
++     */
++    bool hyperVMode() const;
++    void setHyperVMode(bool enabled);
++
++    /**
++     * The AF_VSOCK CID to bind to when transport() == Transport::Vsock.
++     *
++     * Defaults to VMADDR_CID_ANY (0xFFFFFFFFU).
++     */
++    quint32 vsockBindCid() const;
++    void setVsockBindCid(quint32 cid);
++
++    /**
++     * The only AF_VSOCK peer CID permitted to connect when transport() == Transport::Vsock.
++     *
++     * Defaults to VMADDR_CID_HOST (2), enforcing the Hyper-V host trust boundary.
++     * Wildcard VMADDR_CID_ANY (0xFFFFFFFFU) is rejected by start().
++     */
++    quint32 allowedVsockPeerCid() const;
++    void setAllowedVsockPeerCid(quint32 cid);
++
++    /**
++     * Whether the server is currently listening (on either TCP or AF_VSOCK).
++     */
++    bool isListeningTransport() const;
++
+     /**
+      * The host address to listen on.
+      *

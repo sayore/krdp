@@ -39,13 +39,19 @@ class KRDP_EXPORT Server : public QTcpServer
     Q_OBJECT
 
 public:
+    enum class Transport {
+        Tcp,
+        Vsock,
+    };
+    Q_ENUM(Transport)
+
     explicit Server(QObject *parent = nullptr);
     ~Server() override;
 
     /**
      * Start listening for incoming connections.
      *
-     * Note that `address` and `port` should be set before calling this,
+     * Note that `transport`, `address`, and `port` should be set before calling this,
      * changing them after the server has started listening has no effect.
      */
     bool start();
@@ -53,6 +59,46 @@ public:
      * Stop listening for incoming connections.
      */
     void stop();
+
+    /**
+     * The transport used to accept incoming RDP connections.
+     *
+     * Defaults to Transport::Tcp.
+     */
+    Transport transport() const;
+    void setTransport(Transport newTransport);
+
+    /**
+     * Whether Hyper-V VMConnect mode (FreeRDP_VmConnectMode) is enabled.
+     *
+     * This capability is strictly restricted to Transport::Vsock connections
+     * from the authorized Hyper-V host peer CID. Enabling it on Transport::Tcp
+     * causes start() to fail.
+     */
+    bool hyperVMode() const;
+    void setHyperVMode(bool enabled);
+
+    /**
+     * The AF_VSOCK CID to bind to when transport() == Transport::Vsock.
+     *
+     * Defaults to VMADDR_CID_ANY (0xFFFFFFFFU).
+     */
+    quint32 vsockBindCid() const;
+    void setVsockBindCid(quint32 cid);
+
+    /**
+     * The only AF_VSOCK peer CID permitted to connect when transport() == Transport::Vsock.
+     *
+     * Defaults to VMADDR_CID_HOST (2), enforcing the Hyper-V host trust boundary.
+     * Wildcard VMADDR_CID_ANY (0xFFFFFFFFU) is rejected by start().
+     */
+    quint32 allowedVsockPeerCid() const;
+    void setAllowedVsockPeerCid(quint32 cid);
+
+    /**
+     * Whether the server is currently listening (on either TCP or AF_VSOCK).
+     */
+    bool isListeningTransport() const;
 
     /**
      * The host address to listen on.

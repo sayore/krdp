@@ -4,9 +4,18 @@
 
 #include "Server.h"
 
+#include <cerrno>
+#include <cstring>
 #include <vector>
 
 #include <QCoreApplication>
+#include <QSocketNotifier>
+
+#ifdef HAVE_LINUX_VM_SOCKETS_H
+#include <linux/vm_sockets.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
 
 #include <freerdp/channels/channels.h>
 #include <freerdp/freerdp.h>
@@ -18,11 +27,29 @@
 
 using namespace KRdp;
 
+namespace
+{
+#ifdef HAVE_LINUX_VM_SOCKETS_H
+constexpr quint32 DefaultVsockBindCid = VMADDR_CID_ANY;
+constexpr quint32 DefaultVsockPeerCid = VMADDR_CID_HOST;
+#else
+constexpr quint32 DefaultVsockBindCid = 0xFFFFFFFFU;
+constexpr quint32 DefaultVsockPeerCid = 2U;
+#endif
+}
+
 class KRDP_NO_EXPORT Server::Private
 {
 public:
     std::vector<std::unique_ptr<RdpConnection>> sessions;
     rdp_settings *settings = nullptr;
+
+    Transport transport = Transport::Tcp;
+    bool hyperVMode = false;
+    quint32 vsockBindCid = DefaultVsockBindCid;
+    quint32 allowedVsockPeerCid = DefaultVsockPeerCid;
+    int vsockFd = -1;
+    std::unique_ptr<QSocketNotifier> vsockNotifier;
 
     QHostAddress address = QHostAddress::LocalHost;
     quint16 port = 3389;
@@ -55,10 +82,122 @@ bool Server::start()
         return false;
     }
 
-    if (!listen(d->address, d->port)) {
-        // NOTE: We cannot use QTcpServer methods to get the server address and port because it won't initialize them if listen fails.
-        qCCritical(KRDP) << "Unable to listen for connections on" << d->address << d->port;
+    if (d->transport == Transport::Tcp) {
+        if (d->hyperVMode) {
+            qCCritical(KRDP) << "Hyper-V VMConnect mode is strictly restricted to AF_VSOCK transport and cannot be enabled on TCP";
+            return false;
+        }
+
+        if (!listen(d->address, d->port)) {
+            // NOTE: We cannot use QTcpServer methods to get the server address and port because it won't initialize them if listen fails.
+            qCCritical(KRDP) << "Unable to listen for connections on" << d->address << d->port;
+            return false;
+        }
+    } else if (d->transport == Transport::Vsock) {
+#ifdef HAVE_LINUX_VM_SOCKETS_H
+        if (d->allowedVsockPeerCid == VMADDR_CID_ANY) {
+            qCCritical(KRDP) << "Refusing to start AF_VSOCK listener with wildcard peer CID (VMADDR_CID_ANY)";
+            return false;
+        }
+
+        const int fd = ::socket(AF_VSOCK, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        if (fd < 0) {
+            qCCritical(KRDP) << "Unable to create AF_VSOCK socket:" << std::strerror(errno);
+            return false;
+        }
+
+        const int reuse = 1;
+        if (::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
+            qCWarning(KRDP) << "setsockopt(SO_REUSEADDR) on AF_VSOCK socket failed:" << std::strerror(errno);
+        }
+
+        sockaddr_vm addr{};
+        addr.svm_family = AF_VSOCK;
+        addr.svm_cid = d->vsockBindCid;
+        addr.svm_port = d->port;
+
+        if (::bind(fd, reinterpret_cast<const sockaddr *>(&addr), sizeof(addr)) < 0) {
+            qCCritical(KRDP) << "Unable to bind AF_VSOCK socket on cid" << d->vsockBindCid << "port" << d->port << ":" << std::strerror(errno);
+            ::close(fd);
+            return false;
+        }
+
+        if (::listen(fd, 16) < 0) {
+            qCCritical(KRDP) << "Unable to listen on AF_VSOCK socket on cid" << d->vsockBindCid << "port" << d->port << ":" << std::strerror(errno);
+            ::close(fd);
+            return false;
+        }
+
+        d->vsockFd = fd;
+        d->vsockNotifier = std::make_unique<QSocketNotifier>(d->vsockFd, QSocketNotifier::Read, this);
+        connect(d->vsockNotifier.get(), &QSocketNotifier::activated, this, [this]() {
+            while (d->vsockFd >= 0) {
+                sockaddr_vm peerAddr{};
+                socklen_t peerLen = sizeof(peerAddr);
+                const int clientFd = ::accept4(d->vsockFd, reinterpret_cast<sockaddr *>(&peerAddr), &peerLen, SOCK_CLOEXEC);
+                if (clientFd < 0) {
+                    if (errno == EAGAIN
+#if defined(EWOULDBLOCK) && EWOULDBLOCK != EAGAIN
+                        || errno == EWOULDBLOCK
+#endif
+                    ) {
+                        break;
+                    }
+                    if (errno == EINTR) {
+                        continue;
+                    }
+                    qCWarning(KRDP) << "accept4() on AF_VSOCK failed:" << std::strerror(errno);
+                    break;
+                }
+
+                if (peerLen < sizeof(sockaddr_vm) || peerAddr.svm_family != AF_VSOCK) {
+                    qCWarning(KRDP) << "Rejecting non-AF_VSOCK peer on AF_VSOCK listener (family" << peerAddr.svm_family << ")";
+                    ::close(clientFd);
+                    continue;
+                }
+
+                if (peerAddr.svm_cid != d->allowedVsockPeerCid) {
+                    qCWarning(KRDP) << "Rejecting unauthorized AF_VSOCK peer CID" << peerAddr.svm_cid << "(expected" << d->allowedVsockPeerCid << ")";
+                    ::close(clientFd);
+                    continue;
+                }
+
+                qCInfo(KRDP) << "Accepted AF_VSOCK connection from CID" << peerAddr.svm_cid << "port" << peerAddr.svm_port
+                             << (d->hyperVMode ? "(Hyper-V VMConnect mode)" : "(standard TLS/NLA mode)");
+
+                RdpConnection::TransportInfo info;
+                info.transport = Transport::Vsock;
+                info.vmConnectMode = d->hyperVMode;
+                info.vsockPeerCid = peerAddr.svm_cid;
+                info.vsockPeerPort = peerAddr.svm_port;
+
+                auto session = std::make_unique<RdpConnection>(this, clientFd, info);
+                auto sessionPtr = session.get();
+                connect(
+                    sessionPtr,
+                    &RdpConnection::stateChanged,
+                    this,
+                    [this, sessionPtr](RdpConnection::State state) {
+                        if (state == RdpConnection::State::Closed) {
+                            auto itr = std::find_if(d->sessions.begin(), d->sessions.end(), [sessionPtr](auto &session) {
+                                return session.get() == sessionPtr;
+                            });
+                            if (itr == d->sessions.end()) {
+                                return;
+                            }
+                            auto session = std::move(*itr);
+                            d->sessions.erase(itr);
+                        }
+                    },
+                    Qt::QueuedConnection);
+                d->sessions.push_back(std::move(session));
+                Q_EMIT newConnectionCreated(sessionPtr);
+            }
+        });
+#else
+        qCCritical(KRDP) << "AF_VSOCK transport requested, but KRdp was built without <linux/vm_sockets.h>";
         return false;
+#endif
     }
 
     // FreeRDP3 tries to use a global instance of the settings object when
@@ -66,18 +205,82 @@ bool Server::start()
     // global default instance. So create one here and use that.
     d->settings = freerdp_settings_new(FREERDP_SETTINGS_SERVER_MODE);
 
-    qCDebug(KRDP) << "Listening for connections on" << serverAddress() << serverPort();
+    if (d->transport == Transport::Vsock) {
+        qCInfo(KRDP) << "Listening for AF_VSOCK connections on cid" << d->vsockBindCid << "port" << d->port << "allowedPeerCid" << d->allowedVsockPeerCid
+                     << "hyperVMode" << d->hyperVMode;
+    } else {
+        qCDebug(KRDP) << "Listening for connections on" << serverAddress() << serverPort();
+    }
     return true;
 }
 
 void Server::stop()
 {
+    if (d->vsockNotifier) {
+        d->vsockNotifier->setEnabled(false);
+        d->vsockNotifier.reset();
+    }
+#ifdef HAVE_LINUX_VM_SOCKETS_H
+    if (d->vsockFd >= 0) {
+        ::close(d->vsockFd);
+        d->vsockFd = -1;
+    }
+#endif
+
     close();
 
     if (d->settings) {
         freerdp_settings_free(d->settings);
         d->settings = nullptr;
     }
+}
+
+Server::Transport Server::transport() const
+{
+    return d->transport;
+}
+
+void Server::setTransport(Transport newTransport)
+{
+    d->transport = newTransport;
+}
+
+bool Server::hyperVMode() const
+{
+    return d->hyperVMode;
+}
+
+void Server::setHyperVMode(bool enabled)
+{
+    d->hyperVMode = enabled;
+}
+
+quint32 Server::vsockBindCid() const
+{
+    return d->vsockBindCid;
+}
+
+void Server::setVsockBindCid(quint32 cid)
+{
+    d->vsockBindCid = cid;
+}
+
+quint32 Server::allowedVsockPeerCid() const
+{
+    return d->allowedVsockPeerCid;
+}
+
+void Server::setAllowedVsockPeerCid(quint32 cid)
+{
+    d->allowedVsockPeerCid = cid;
+}
+
+bool Server::isListeningTransport() const
+{
+    if (d->transport == Transport::Vsock) {
+        return d->vsockFd >= 0;
+    }
+    return isListening();
 }
 
 QHostAddress Server::address() const
