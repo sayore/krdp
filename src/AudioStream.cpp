@@ -376,7 +376,7 @@ bool AudioStream::initialize(bool useDynamicChannel)
     ctx->server_formats = d->serverFormats.data();
     ctx->num_server_formats = d->serverFormats.size();
     ctx->src_format = &d->srcFormat;
-    ctx->latency = 15;
+    ctx->latency = 5;
     ctx->Activated = Private::activatedCallback;
     ctx->ConfirmBlock = Private::confirmBlockCallback;
     ctx->ChannelIdAssigned = Private::channelIdAssignedCallback;
@@ -525,9 +525,9 @@ bool AudioStream::Private::startPipeWireCaptureLocked(uint32_t sampleRate, uint1
         pw_init(nullptr, nullptr);
     });
 
-    framesPerChunk = std::max<size_t>(160, sampleRate / 100); // ~10 ms low-latency RDPSND packet
+    framesPerChunk = std::max<size_t>(120, sampleRate / 200); // ~5 ms ultra-low-latency RDPSND packet (240 frames @ 48 kHz)
     samplesPerChunk = framesPerChunk * channels;
-    // Bounded low-latency ring buffer (~80 ms minimum, rounded to power-of-two) allocated ONCE before RT thread starts.
+    // Bounded ultra-low-latency ring buffer (~40 ms minimum, rounded to power-of-two) allocated ONCE before RT thread starts.
     ringBuffer.configure(samplesPerChunk * 8);
 
     if (wakeEventFd < 0) {
@@ -559,7 +559,7 @@ bool AudioStream::Private::startPipeWireCaptureLocked(uint32_t sampleRate, uint1
     char latencySpec[64] = {};
     std::snprintf(latencySpec, sizeof(latencySpec), "%zu/%u", framesPerChunk, sampleRate);
     char maxLatencySpec[64] = {};
-    std::snprintf(maxLatencySpec, sizeof(maxLatencySpec), "%zu/%u", framesPerChunk * 2, sampleRate);
+    std::snprintf(maxLatencySpec, sizeof(maxLatencySpec), "%zu/%u", framesPerChunk, sampleRate);
 
     pw_thread_loop_lock(pwLoop);
 
@@ -589,6 +589,8 @@ bool AudioStream::Private::startPipeWireCaptureLocked(uint32_t sampleRate, uint1
                                              latencySpec,
                                              PW_KEY_NODE_MAX_LATENCY,
                                              maxLatencySpec,
+                                             "session.suspend-timeout-seconds",
+                                             "0",
                                              "monitor.channel-volumes",
                                              "true",
                                              nullptr);
@@ -709,9 +711,9 @@ void AudioStream::Private::onActivated(RdpsndServerContext *context)
 void AudioStream::Private::runTxLoop(std::stop_token stopToken, size_t chunkFrames, size_t chunkSamples)
 {
     const auto startTime = std::chrono::steady_clock::now();
-    constexpr int SilenceTailChunks = 40; // 400 ms tail at 10 ms/chunk
-    constexpr int MaxInFlightBlocks = 4; // ~40 ms in-flight latency cap
-    constexpr size_t MaxBufferedChunksBeforeTrim = 3; // trim stale backlog above ~30 ms
+    constexpr int SilenceTailChunks = 60; // 300 ms tail at 5 ms/chunk
+    constexpr int MaxInFlightBlocks = 3; // ~15 ms max in-flight latency over local AF_VSOCK
+    constexpr size_t MaxBufferedChunksBeforeTrim = 2; // trim stale backlog above ~10 ms down to ~5 ms
     int silentChunksRemaining = 0;
 
     std::vector<int16_t> chunk(chunkSamples);
@@ -723,22 +725,21 @@ void AudioStream::Private::runTxLoop(std::stop_token stopToken, size_t chunkFram
                 pollfd pfd{};
                 pfd.fd = wakeEventFd;
                 pfd.events = POLLIN;
-                const int rc = ::poll(&pfd, 1, 10);
+                const int rc = ::poll(&pfd, 1, 5);
                 if (rc > 0 && (pfd.revents & POLLIN)) {
                     uint64_t drained = 0;
                     const ssize_t ignored = ::read(wakeEventFd, &drained, sizeof(drained));
                     (void)ignored;
                 }
             } else {
-                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
             continue;
         }
 
-        // Prevent permanent audio lag after transient spikes (e.g. volume wheel chimes) by trimming stale backlog down to ~10 ms.
+        // Keep latency pinned near the physical floor (~5 ms queued) by trimming stale excess backlog.
         if (avail > chunkSamples * MaxBufferedChunksBeforeTrim) {
-            const size_t targetKeep = chunkSamples;
-            ringBuffer.discard(avail - targetKeep);
+            ringBuffer.discard(avail - chunkSamples);
         }
 
         const size_t got = ringBuffer.read(chunk.data(), chunkSamples);
@@ -761,7 +762,7 @@ void AudioStream::Private::runTxLoop(std::stop_token stopToken, size_t chunkFram
 
         if (inFlightBlocks.load(std::memory_order_acquire) >= MaxInFlightBlocks) {
             const uint64_t lastConf = lastConfirmSteadyMs.load(std::memory_order_acquire);
-            if (lastConf != 0 && (nowMs - lastConf) > 250) {
+            if (lastConf != 0 && (nowMs - lastConf) > 150) {
                 inFlightBlocks.store(0, std::memory_order_release);
             } else {
                 continue;
