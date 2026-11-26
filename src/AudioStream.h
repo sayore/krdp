@@ -56,6 +56,7 @@ public:
         size_t write(const int16_t *src, size_t count);
         // Consumer TX thread only: wait-free, allocation-free.
         size_t read(int16_t *dst, size_t count);
+        size_t discard(size_t count);
 
     private:
         std::vector<int16_t> m_storage;
