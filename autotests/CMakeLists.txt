@@ -18,6 +18,11 @@ ecm_add_test(videostreamqualitytest.cpp
     LINK_LIBRARIES KRdp Qt6::Test Qt6::Gui Qt6::Network
 )
 
+ecm_add_test(clipboardimagetest.cpp
+    TEST_NAME clipboardimagetest
+    LINK_LIBRARIES KRdp Qt6::Test Qt6::Gui
+)
+
 ecm_add_test(vmconnectauthtest.cpp
     ../src/RdpConnection.cpp
     ../src/PeerContext.cpp
