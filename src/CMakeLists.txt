@@ -16,6 +16,8 @@ endif()
 
 target_sources(KRdp PRIVATE
     AbstractSession.cpp
+    AudioStream.cpp
+    AudioStream.h
     Clipboard.cpp
     Clipboard.h
     DisplayControl.cpp
@@ -66,6 +68,11 @@ target_include_directories(KRdp PUBLIC ${FreeRDP_INCLUDE_DIR} ${WinPR_INCLUDE_DI
 
 if(HAVE_LINUX_VM_SOCKETS_H)
     target_compile_definitions(KRdp PUBLIC HAVE_LINUX_VM_SOCKETS_H)
+endif()
+
+if(PipeWire_FOUND)
+    target_compile_definitions(KRdp PRIVATE HAVE_PIPEWIRE_AUDIO)
+    target_link_libraries(KRdp PRIVATE PkgConfig::PipeWire)
 endif()
 
 target_link_libraries(KRdp PUBLIC
