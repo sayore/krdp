@@ -3,10 +3,12 @@
 
 #include "InBandGreeter.h"
 
+#include <cstdlib>
 #include <cstring>
 
 #include <QColor>
 #include <QElapsedTimer>
+#include <QFile>
 #include <QFont>
 #include <QKeyEvent>
 #include <QMouseEvent>
@@ -15,6 +17,7 @@
 #include <QRect>
 #include <QTimer>
 
+#include <xkbcommon/xkbcommon-compose.h>
 #include <xkbcommon/xkbcommon.h>
 
 #include "RdpConnection.h"
@@ -77,29 +80,151 @@ public:
 
     QTimer idleTimer;
     QTimer refreshTimer;
+    QTimer blinkTimer;
+    bool caretVisible = true;
+    uint64_t framesEmitted = 0;
 
+    quint32 rdpKeyboardLayout = 0;
+    QByteArray xkbLayoutName;
+    QByteArray xkbVariantName;
     xkb_context *xkbCtx = nullptr;
     xkb_keymap *xkbKeymap = nullptr;
     xkb_state *xkbState = nullptr;
+    xkb_compose_table *xkbComposeTable = nullptr;
+    xkb_compose_state *xkbComposeState = nullptr;
+
+    void resolveXkbNames()
+    {
+        xkbLayoutName.clear();
+        xkbVariantName.clear();
+
+        // Map Windows RDP KeyboardLayout LCID (CS_CORE keyboardLayout) to XKB layout.
+        const quint16 langId = static_cast<quint16>(rdpKeyboardLayout & 0xFFFFu);
+        switch (langId) {
+        case 0x0407: // German (Germany)
+        case 0x0C07: // German (Austria)
+            xkbLayoutName = "de";
+            break;
+        case 0x0807: // German (Switzerland)
+            xkbLayoutName = "ch";
+            break;
+        case 0x0409: // English (US)
+            xkbLayoutName = "us";
+            break;
+        case 0x0809: // English (UK)
+            xkbLayoutName = "gb";
+            break;
+        case 0x040C: // French (France)
+            xkbLayoutName = "fr";
+            break;
+        case 0x0410: // Italian
+            xkbLayoutName = "it";
+            break;
+        case 0x040A: // Spanish
+            xkbLayoutName = "es";
+            break;
+        case 0x0413: // Dutch
+            xkbLayoutName = "nl";
+            break;
+        case 0x0415: // Polish
+            xkbLayoutName = "pl";
+            break;
+        case 0x041D: // Swedish
+            xkbLayoutName = "se";
+            break;
+        case 0x0414: // Norwegian
+            xkbLayoutName = "no";
+            break;
+        case 0x0406: // Danish
+            xkbLayoutName = "dk";
+            break;
+        case 0x040B: // Finnish
+            xkbLayoutName = "fi";
+            break;
+        case 0x0816: // Portuguese (Portugal)
+            xkbLayoutName = "pt";
+            break;
+        case 0x0416: // Portuguese (Brazil)
+            xkbLayoutName = "br";
+            break;
+        default:
+            break;
+        }
+
+        // Fall back to /etc/vconsole.conf XKBLAYOUT / XKBVARIANT if RDP did not specify a mapped layout.
+        if (xkbLayoutName.isEmpty()) {
+            QFile vc(QStringLiteral("/etc/vconsole.conf"));
+            if (vc.open(QIODevice::ReadOnly | QIODevice::Text)) {
+                const QList<QByteArray> lines = vc.readAll().split('\n');
+                for (const QByteArray &raw : lines) {
+                    const QByteArray line = raw.trimmed();
+                    if (line.startsWith("XKBLAYOUT=")) {
+                        xkbLayoutName = line.mid(10).trimmed().replace('"', "");
+                    } else if (line.startsWith("XKBVARIANT=")) {
+                        xkbVariantName = line.mid(11).trimmed().replace('"', "");
+                    }
+                }
+            }
+        }
+    }
 
     void initXkb()
     {
-        if (xkbCtx) {
-            return;
-        }
+        cleanupXkb();
+        resolveXkbNames();
         xkbCtx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
         if (!xkbCtx) {
             return;
         }
         xkb_rule_names names{};
+        if (!xkbLayoutName.isEmpty()) {
+            names.layout = xkbLayoutName.constData();
+        }
+        if (!xkbVariantName.isEmpty()) {
+            names.variant = xkbVariantName.constData();
+        }
         xkbKeymap = xkb_keymap_new_from_names(xkbCtx, &names, XKB_KEYMAP_COMPILE_NO_FLAGS);
+        if (!xkbKeymap && !xkbLayoutName.isEmpty()) {
+            xkbLayoutName.clear();
+            xkbVariantName.clear();
+            xkb_rule_names fallback{};
+            xkbKeymap = xkb_keymap_new_from_names(xkbCtx, &fallback, XKB_KEYMAP_COMPILE_NO_FLAGS);
+        }
         if (xkbKeymap) {
             xkbState = xkb_state_new(xkbKeymap);
+        }
+
+        // Load XKB compose table for dead keys and composed characters (e.g. ´ + e -> é, ^ + a -> â).
+        const char *locales[] = {
+            std::getenv("LC_ALL"),
+            std::getenv("LC_CTYPE"),
+            std::getenv("LANG"),
+            "en_US.UTF-8",
+            "C.UTF-8",
+            "C",
+        };
+        for (const char *loc : locales) {
+            if (!loc || loc[0] == '\0') {
+                continue;
+            }
+            xkbComposeTable = xkb_compose_table_new_from_locale(xkbCtx, loc, XKB_COMPOSE_COMPILE_NO_FLAGS);
+            if (xkbComposeTable) {
+                xkbComposeState = xkb_compose_state_new(xkbComposeTable, XKB_COMPOSE_STATE_NO_FLAGS);
+                break;
+            }
         }
     }
 
     void cleanupXkb()
     {
+        if (xkbComposeState) {
+            xkb_compose_state_unref(xkbComposeState);
+            xkbComposeState = nullptr;
+        }
+        if (xkbComposeTable) {
+            xkb_compose_table_unref(xkbComposeTable);
+            xkbComposeTable = nullptr;
+        }
         if (xkbState) {
             xkb_state_unref(xkbState);
             xkbState = nullptr;
@@ -132,14 +257,27 @@ InBandGreeter::InBandGreeter(RdpConnection *connection, QObject *parent)
         Q_EMIT failedAndClose(QStringLiteral("Authentication timeout"));
     });
 
-    // Periodic gentle redraw while greeter is visible so clients that open RDPGFX
-    // slightly after start always receive the login screen promptly.
-    d->refreshTimer.setSingleShot(false);
-    d->refreshTimer.setInterval(1000);
+    // Single-shot startup fallback redraw in case RDPGFX finishes confirming slightly
+    // after start(). Subsequent redraws are driven by VideoStream::capsConfirmed(),
+    // resize events, and interactive input so idle greeter sessions never flood the
+    // RDPGFX in-flight acknowledgement window with redundant full-screen frames.
+    d->refreshTimer.setSingleShot(true);
+    d->refreshTimer.setInterval(1500);
     connect(&d->refreshTimer, &QTimer::timeout, this, [this]() {
         if (d->active) {
+            qCInfo(KRDP) << "In-band greeter emitting startup fallback frame";
             emitFrame();
         }
+    });
+
+    d->blinkTimer.setSingleShot(false);
+    d->blinkTimer.setInterval(550);
+    connect(&d->blinkTimer, &QTimer::timeout, this, [this]() {
+        if (!d->active) {
+            return;
+        }
+        d->caretVisible = !d->caretVisible;
+        emitFrame();
     });
 }
 
@@ -177,17 +315,28 @@ void InBandGreeter::start(const QSize &initialSize, const QString &defaultUserna
     }
     clearPasswordBuffer();
 
+    d->framesEmitted = 0;
+    d->caretVisible = true;
     resetIdleTimer();
     d->refreshTimer.start();
+    d->blinkTimer.start();
+    qCInfo(KRDP) << "In-band greeter started: size" << d->screenSize << "xkbReady" << (d->xkbState != nullptr) << "xkbLayout"
+                 << (d->xkbLayoutName.isEmpty() ? QByteArray("default") : d->xkbLayoutName) << "rdpKbdLayout" << Qt::hex << d->rdpKeyboardLayout << Qt::dec
+                 << "defaultUserPrefilled" << !d->username.isEmpty() << "initialFocus" << (d->focus == FocusField::Username ? "Username" : "Password");
     emitFrame();
 }
 
 void InBandGreeter::stop()
 {
+    const bool wasActive = d->active;
     d->active = false;
     d->idleTimer.stop();
     d->refreshTimer.stop();
+    d->blinkTimer.stop();
     clearPasswordBuffer();
+    if (wasActive) {
+        qCInfo(KRDP) << "In-band greeter stopped after" << d->framesEmitted << "emitted frame(s)";
+    }
 }
 
 bool InBandGreeter::isActive() const
@@ -205,10 +354,29 @@ void InBandGreeter::setScreenSize(const QSize &size)
     if (size.width() < 640 || size.height() < 480 || size == d->screenSize) {
         return;
     }
+    qCInfo(KRDP) << "In-band greeter screen size changed:" << d->screenSize << "->" << size;
     d->screenSize = size;
     if (d->active) {
         emitFrame();
     }
+}
+
+void InBandGreeter::setKeyboardLayout(quint32 rdpKeyboardLayout)
+{
+    d->rdpKeyboardLayout = rdpKeyboardLayout;
+    if (d->active) {
+        d->initXkb();
+    }
+}
+
+void InBandGreeter::requestRedraw()
+{
+    if (!d->active) {
+        return;
+    }
+    d->refreshTimer.stop();
+    qCInfo(KRDP) << "In-band greeter redraw requested (e.g. RDPGFX caps confirmed)";
+    emitFrame();
 }
 
 void InBandGreeter::clearPasswordBuffer()
@@ -230,6 +398,10 @@ void InBandGreeter::handleInputEvent(const std::shared_ptr<QInputEvent> &event)
     }
 
     resetIdleTimer();
+    if (event->type() == QEvent::KeyPress || event->type() == QEvent::MouseButtonPress) {
+        d->caretVisible = true;
+        d->blinkTimer.start();
+    }
 
     if (event->type() == QEvent::MouseButtonPress) {
         const auto *mouse = static_cast<const QMouseEvent *>(event.get());
@@ -237,13 +409,20 @@ void InBandGreeter::handleInputEvent(const std::shared_ptr<QInputEvent> &event)
             const QPoint pt = mouse->position().toPoint();
             const CardLayout layout = computeLayout(d->screenSize);
             if (layout.userFieldRect.contains(pt)) {
+                if (d->focus != FocusField::Username) {
+                    qCInfo(KRDP) << "In-band greeter focus changed -> Username (mouse)";
+                }
                 d->focus = FocusField::Username;
                 emitFrame();
             } else if (layout.passFieldRect.contains(pt)) {
+                if (d->focus != FocusField::Password) {
+                    qCInfo(KRDP) << "In-band greeter focus changed -> Password (mouse)";
+                }
                 d->focus = FocusField::Password;
                 emitFrame();
             } else if (layout.buttonRect.contains(pt)) {
-                submitCurrentInputs();
+                qCInfo(KRDP) << "In-band greeter Sign In triggered (mouse)";
+                QMetaObject::invokeMethod(this, &InBandGreeter::submitCurrentInputs, Qt::QueuedConnection);
             }
         }
         return;
@@ -263,10 +442,38 @@ void InBandGreeter::handleInputEvent(const std::shared_ptr<QInputEvent> &event)
         const xkb_keycode_t xkbCode = static_cast<xkb_keycode_t>(key->nativeScanCode() + 8);
         sym = xkb_state_key_get_one_sym(d->xkbState, xkbCode);
         if (isPress) {
-            char utf8Buf[32] = {};
-            const int len = xkb_state_key_get_utf8(d->xkbState, xkbCode, utf8Buf, sizeof(utf8Buf));
-            if (len > 0) {
-                text = QString::fromUtf8(utf8Buf, len);
+            bool handledByCompose = false;
+            if (d->xkbComposeState && sym != XKB_KEY_NoSymbol) {
+                if (xkb_compose_state_feed(d->xkbComposeState, sym) == XKB_COMPOSE_FEED_ACCEPTED) {
+                    const xkb_compose_status status = xkb_compose_state_get_status(d->xkbComposeState);
+                    if (status == XKB_COMPOSE_COMPOSING) {
+                        handledByCompose = true;
+                        sym = XKB_KEY_NoSymbol;
+                    } else if (status == XKB_COMPOSE_COMPOSED) {
+                        char composeBuf[64] = {};
+                        const int clen = xkb_compose_state_get_utf8(d->xkbComposeState, composeBuf, sizeof(composeBuf));
+                        if (clen > 0) {
+                            text = QString::fromUtf8(composeBuf, clen);
+                        }
+                        const xkb_keysym_t composedSym = xkb_compose_state_get_one_sym(d->xkbComposeState);
+                        if (composedSym != XKB_KEY_NoSymbol) {
+                            sym = composedSym;
+                        }
+                        xkb_compose_state_reset(d->xkbComposeState);
+                        handledByCompose = true;
+                    } else if (status == XKB_COMPOSE_CANCELLED) {
+                        xkb_compose_state_reset(d->xkbComposeState);
+                        handledByCompose = true;
+                        sym = XKB_KEY_NoSymbol;
+                    }
+                }
+            }
+            if (!handledByCompose) {
+                char utf8Buf[32] = {};
+                const int len = xkb_state_key_get_utf8(d->xkbState, xkbCode, utf8Buf, sizeof(utf8Buf));
+                if (len > 0) {
+                    text = QString::fromUtf8(utf8Buf, len);
+                }
             }
         }
         xkb_state_update_key(d->xkbState, xkbCode, isPress ? XKB_KEY_DOWN : XKB_KEY_UP);
@@ -286,6 +493,7 @@ void InBandGreeter::handleInputEvent(const std::shared_ptr<QInputEvent> &event)
 
     if (sym == XKB_KEY_Tab || sym == XKB_KEY_ISO_Left_Tab) {
         d->focus = (d->focus == FocusField::Username) ? FocusField::Password : FocusField::Username;
+        qCInfo(KRDP) << "In-band greeter focus changed ->" << (d->focus == FocusField::Username ? "Username" : "Password") << "(Tab)";
         emitFrame();
         return;
     }
@@ -301,9 +509,11 @@ void InBandGreeter::handleInputEvent(const std::shared_ptr<QInputEvent> &event)
     if (sym == XKB_KEY_Return || sym == XKB_KEY_KP_Enter) {
         if (d->focus == FocusField::Username && d->password.isEmpty()) {
             d->focus = FocusField::Password;
+            qCInfo(KRDP) << "In-band greeter focus changed -> Password (Return)";
             emitFrame();
         } else {
-            submitCurrentInputs();
+            qCInfo(KRDP) << "In-band greeter Sign In triggered (Return)";
+            QMetaObject::invokeMethod(this, &InBandGreeter::submitCurrentInputs, Qt::QueuedConnection);
         }
         return;
     }
@@ -467,7 +677,7 @@ QImage InBandGreeter::renderFrame() const
         QFont inputFont(QStringLiteral("Sans Serif"), 11);
         p.setFont(inputFont);
         p.setPen(QColor(0xf2, 0xf5, 0xfa));
-        const QString shown = focused ? (displayText + QStringLiteral("|")) : displayText;
+        const QString shown = (focused && d->caretVisible) ? (displayText + QStringLiteral("|")) : displayText;
         p.drawText(rect.adjusted(12, 0, -12, 0), Qt::AlignLeft | Qt::AlignVCenter, shown);
     };
 
@@ -497,6 +707,10 @@ void InBandGreeter::emitFrame()
 {
     if (!d->active) {
         return;
+    }
+    d->framesEmitted++;
+    if (d->framesEmitted <= 3) {
+        qCInfo(KRDP) << "In-band greeter emitting frame" << d->framesEmitted << "size" << d->screenSize;
     }
     Q_EMIT frameReady(renderFrame());
 }

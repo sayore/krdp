@@ -11,6 +11,7 @@
 #include <xkbcommon/xkbcommon.h>
 
 #include "PeerContext_p.h"
+#include "RdpConnection.h"
 
 #include "krdp_logging.h"
 
@@ -70,6 +71,16 @@ public:
     // Keycodes the client currently holds, so they can be released if a key-release
     // is lost and the client re-synchronizes its keyboard state.
     QSet<quint32> pressedKeys;
+
+    // Pending UTF-16 high surrogates for non-BMP Unicode input events (press/release).
+    uint16_t pendingHighSurrogatePress = 0;
+    uint16_t pendingHighSurrogateRelease = 0;
+
+    // Privacy-safe diagnostic counters for PendingInBandGreeter (never logs keys/chars/passwords).
+    uint64_t greeterKeyEvents = 0;
+    uint64_t greeterMouseMoveEvents = 0;
+    uint64_t greeterMouseButtonEvents = 0;
+    uint64_t greeterSyncEvents = 0;
 };
 
 InputHandler::InputHandler(KRdp::RdpConnection *session)
@@ -95,8 +106,16 @@ void InputHandler::initialize(rdpInput *input)
 
 bool InputHandler::synchronizeEvent(uint32_t /*flags*/)
 {
+    if (d->session && d->session->authState() == RdpConnection::AuthState::PendingInBandGreeter) {
+        d->greeterSyncEvents++;
+        if (d->greeterSyncEvents == 1) {
+            qCInfo(KRDP) << "In-band greeter received first keyboard synchronize event";
+        }
+    }
     // Client is resynchronizing its keyboard state; release any keys we still
     // believe are held so a lost key-release does not leave a key stuck down.
+    d->pendingHighSurrogatePress = 0;
+    d->pendingHighSurrogateRelease = 0;
     const auto stuck = d->pressedKeys;
     d->pressedKeys.clear();
     if (!stuck.isEmpty()) {
@@ -170,8 +189,20 @@ bool InputHandler::mouseEvent(uint16_t x, uint16_t y, uint16_t flags)
     std::shared_ptr<QMouseEvent> event;
     if (flags & PTR_FLAGS_DOWN) {
         event = std::make_shared<QMouseEvent>(QEvent::MouseButtonPress, position, QPointF{}, button, button, Qt::NoModifier);
+        if (d->session && d->session->authState() == RdpConnection::AuthState::PendingInBandGreeter) {
+            d->greeterMouseButtonEvents++;
+            if (d->greeterMouseButtonEvents <= 3 || (d->greeterMouseButtonEvents % 10) == 0) {
+                qCInfo(KRDP) << "In-band greeter received mouse button press #" << d->greeterMouseButtonEvents << "pos" << position.toPoint();
+            }
+        }
     } else if (flags & PTR_FLAGS_MOVE) {
         event = std::make_shared<QMouseEvent>(QEvent::MouseMove, position, QPointF{}, button, button, Qt::NoModifier);
+        if (d->session && d->session->authState() == RdpConnection::AuthState::PendingInBandGreeter) {
+            d->greeterMouseMoveEvents++;
+            if (d->greeterMouseMoveEvents == 1) {
+                qCInfo(KRDP) << "In-band greeter received first mouse move event";
+            }
+        }
     } else {
         event = std::make_shared<QMouseEvent>(QEvent::MouseButtonRelease, position, QPointF{}, button, button, Qt::NoModifier);
     }
@@ -192,7 +223,8 @@ bool InputHandler::extendedMouseEvent(uint16_t x, uint16_t y, uint16_t flags)
     } else if (flags & PTR_XFLAGS_BUTTON2) {
         button = Qt::ForwardButton;
     } else {
-        return false;
+        // Ignore unrecognized extended mouse flags instead of failing the RDP input PDU.
+        return true;
     }
 
     std::shared_ptr<QMouseEvent> event;
@@ -209,10 +241,21 @@ bool InputHandler::extendedMouseEvent(uint16_t x, uint16_t y, uint16_t flags)
 
 bool InputHandler::keyboardEvent(uint16_t code, uint16_t flags)
 {
+    if (d->session && d->session->authState() == RdpConnection::AuthState::PendingInBandGreeter) {
+        d->greeterKeyEvents++;
+        if (d->greeterKeyEvents == 1) {
+            // Log only first receipt (never keycodes, flags, counts, or characters).
+            qCInfo(KRDP) << "In-band greeter received first keyboard event (scancode path)";
+        }
+    }
+
     auto virtualCode = GetVirtualKeyCodeFromVirtualScanCode(flags & KBD_FLAGS_EXTENDED ? code | KBDEXT : code, 4);
     virtualCode = flags & KBD_FLAGS_EXTENDED ? virtualCode | KBDEXT : virtualCode;
 
     quint32 keycode = GetKeycodeFromVirtualKeyCode(virtualCode, WINPR_KEYCODE_TYPE_EVDEV);
+    if (keycode == 0) {
+        return true;
+    }
 
     auto type = flags & KBD_FLAGS_RELEASE ? QEvent::KeyRelease : QEvent::KeyPress;
 
@@ -230,13 +273,39 @@ bool InputHandler::keyboardEvent(uint16_t code, uint16_t flags)
 
 bool InputHandler::unicodeKeyboardEvent(uint16_t code, uint16_t flags)
 {
-    auto text = QString(QChar::fromUcs2(code));
-    auto keysym = xkb_utf32_to_keysym(text.toUcs4().first());
-    if (!keysym) {
+    if (d->session && d->session->authState() == RdpConnection::AuthState::PendingInBandGreeter) {
+        d->greeterKeyEvents++;
+        if (d->greeterKeyEvents == 1) {
+            // Log only first receipt (never keycodes, characters, or counts).
+            qCInfo(KRDP) << "In-band greeter received first keyboard event (unicode path)";
+        }
+    }
+
+    const bool isRelease = (flags & KBD_FLAGS_RELEASE) != 0;
+    uint16_t &pendingHigh = isRelease ? d->pendingHighSurrogateRelease : d->pendingHighSurrogatePress;
+
+    uint32_t codePoint = 0;
+    if (QChar::isHighSurrogate(code)) {
+        pendingHigh = code;
+        return true;
+    }
+    if (QChar::isLowSurrogate(code)) {
+        if (pendingHigh == 0) {
+            return true;
+        }
+        codePoint = QChar::surrogateToUcs4(pendingHigh, code);
+        pendingHigh = 0;
+    } else {
+        pendingHigh = 0;
+        codePoint = code;
+    }
+
+    const xkb_keysym_t keysym = xkb_utf32_to_keysym(codePoint);
+    if (keysym == XKB_KEY_NoSymbol) {
         return true;
     }
 
-    auto type = flags & KBD_FLAGS_RELEASE ? QEvent::KeyRelease : QEvent::KeyPress;
+    auto type = isRelease ? QEvent::KeyRelease : QEvent::KeyPress;
 
     auto event = std::make_shared<QKeyEvent>(type, 0, Qt::KeyboardModifiers{}, 0, keysym, 0);
     Q_EMIT inputEvent(event);
