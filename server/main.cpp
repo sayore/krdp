@@ -235,8 +235,11 @@ int main(int argc, char **argv)
     } else {
         controller.setMonitorIndex(parser.isSet(u"monitor"_s) ? std::optional(parser.value(u"monitor"_s).toInt()) : std::nullopt);
     }
-    controller.setQuality(parserValueWithDefault(u"quality", config->quality()));
-    controller.setAdaptiveQuality((parser.isSet(u"adaptive-quality"_s) || config->adaptiveQuality()) && !parser.isSet(u"static-quality"_s));
+    const bool isVsock = (*transport == KRdp::Server::Transport::Vsock);
+    const int defaultQuality = isVsock ? 95 : config->quality();
+    const bool defaultAdaptiveQuality = isVsock ? false : config->adaptiveQuality();
+    controller.setQuality(parserValueWithDefault(u"quality", defaultQuality));
+    controller.setAdaptiveQuality((parser.isSet(u"adaptive-quality"_s) || defaultAdaptiveQuality) && !parser.isSet(u"static-quality"_s));
     if (parser.isSet(u"mode"_s)) {
         const auto mode = parseOperationMode(parser.value(u"mode"_s));
         if (!mode) {
