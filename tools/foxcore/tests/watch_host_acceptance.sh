@@ -51,6 +51,7 @@ summary = {
         "guest_authenticated": has(r"PAM authentication succeeded|In-band greeter authenticated guest user|authenticated successfully"),
         "plasma_session_started": has(r"Started Plasma session|Started portal session"),
         "rdpsnd_audio_activated": has(r"RDPSND audio stream activated"),
+        "audin_mic_negotiated": has(r"AUDIN microphone format negotiated"),
     },
 }
 out_path.write_text(json.dumps(summary, indent=2) + "\n")

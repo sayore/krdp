@@ -16,6 +16,8 @@ endif()
 
 target_sources(KRdp PRIVATE
     AbstractSession.cpp
+    AudioInputStream.cpp
+    AudioInputStream.h
     AudioStream.cpp
     AudioStream.h
     Clipboard.cpp
