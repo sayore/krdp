@@ -28,6 +28,11 @@ ecm_add_test(inputhandlertest.cpp
     LINK_LIBRARIES KRdp Qt6::Test Qt6::Gui Qt6::Network XKB::XKB
 )
 
+ecm_add_test(audiostreamtest.cpp
+    TEST_NAME audiostreamtest
+    LINK_LIBRARIES KRdp Qt6::Test Qt6::Network
+)
+
 ecm_add_test(vmconnectauthtest.cpp
     ../src/RdpConnection.cpp
     ../src/PeerContext.cpp

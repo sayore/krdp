@@ -35,8 +35,10 @@
 #include <freerdp/server/cliprdr.h>
 
 #include <freerdp/channels/drdynvc.h>
+#include <freerdp/channels/rdpsnd.h>
 
 #include "AbstractSession.h"
+#include "AudioStream.h"
 #include "Clipboard.h"
 #include "Cursor.h"
 #include "DisplayControl.h"
@@ -286,6 +288,7 @@ public:
 
     std::unique_ptr<InputHandler> inputHandler;
     std::unique_ptr<InBandGreeter> inBandGreeter;
+    std::unique_ptr<AudioStream> audioStream;
     std::unique_ptr<VideoStream> videoStream;
     std::unique_ptr<Cursor> cursor;
     std::unique_ptr<NetworkDetection> networkDetection;
@@ -339,6 +342,7 @@ RdpConnection::RdpConnection(Server *server, qintptr socketHandle, const Transpo
     d->cursor = std::make_unique<Cursor>(this);
     d->networkDetection = std::make_unique<NetworkDetection>(this);
     d->clipboard = std::make_unique<Clipboard>(this);
+    d->audioStream = std::make_unique<AudioStream>(this);
     d->displayControl = std::make_unique<DisplayControl>(this);
 
     connect(d->inputHandler.get(), &InputHandler::inputEvent, d->inBandGreeter.get(), [this](const std::shared_ptr<QInputEvent> &event) {
@@ -538,6 +542,11 @@ Clipboard *RdpConnection::clipboard() const
     return d->clipboard.get();
 }
 
+AudioStream *RdpConnection::audioStream() const
+{
+    return d->audioStream.get();
+}
+
 DisplayControl *RdpConnection::displayControl() const
 {
     return d->displayControl.get();
@@ -699,8 +708,7 @@ void RdpConnection::initialize()
     // PSEUDO_XSERVER is apparently required for things to work properly.
     freerdp_settings_set_uint32(settings, FreeRDP_OsMinorType, OSMINORTYPE_PSEUDO_XSERVER);
 
-    // TODO: Implement audio support
-    freerdp_settings_set_bool(settings, FreeRDP_AudioPlayback, false);
+    freerdp_settings_set_bool(settings, FreeRDP_AudioPlayback, true);
 
     freerdp_settings_set_uint32(settings, FreeRDP_ColorDepth, 32);
 
@@ -723,7 +731,7 @@ void RdpConnection::initialize()
     freerdp_settings_set_bool(settings, FreeRDP_NetworkAutoDetect, true);
 
     freerdp_settings_set_bool(settings, FreeRDP_RefreshRect, true);
-    freerdp_settings_set_bool(settings, FreeRDP_RemoteConsoleAudio, true);
+    freerdp_settings_set_bool(settings, FreeRDP_RemoteConsoleAudio, false);
     freerdp_settings_set_bool(settings, FreeRDP_RemoteFxCodec, false);
     freerdp_settings_set_bool(settings, FreeRDP_NSCodec, false);
     freerdp_settings_set_bool(settings, FreeRDP_FrameMarkerCommandEnabled, true);
@@ -764,6 +772,7 @@ void RdpConnection::run(std::stop_token stopToken)
 {
     auto context = reinterpret_cast<PeerContext *>(d->peer->context);
     auto channelEvent = WTSVirtualChannelManagerGetEventHandle(context->virtualChannelManager);
+    bool audioInitAttempted = false;
     BYTE lastDrdynvcState = 0xFF;
     bool lastDrdynvcJoined = false;
     setState(State::Running);
@@ -811,6 +820,24 @@ void RdpConnection::run(std::stop_token stopToken)
         if (d->peer->connected && (d->state == State::Activated || d->state == State::Streaming) && cliprdrJoined && isAuthenticated()) {
             if (!d->clipboard->initialize()) {
                 break;
+            }
+        }
+
+        const bool rdpsndSvcJoined = WTSVirtualChannelManagerIsChannelJoined(context->virtualChannelManager, RDPSND_CHANNEL_NAME);
+        if (!audioInitAttempted && d->peer->connected && (d->state == State::Activated || d->state == State::Streaming) && isAuthenticated()) {
+            const bool drdynvcReady = drdynvcJoined && drdynvcState == DRDYNVC_STATE_READY;
+            if (drdynvcReady || rdpsndSvcJoined) {
+                audioInitAttempted = true;
+                bool audioOk = false;
+                if (drdynvcReady) {
+                    audioOk = d->audioStream->initialize(true);
+                }
+                if (!audioOk && rdpsndSvcJoined) {
+                    audioOk = d->audioStream->initialize(false);
+                }
+                if (!audioOk) {
+                    qCWarning(KRDP) << "RDPSND audio redirection could not be started (continuing without audio)";
+                }
             }
         }
 
@@ -975,6 +1002,7 @@ bool RdpConnection::onClose()
     QMetaObject::invokeMethod(d->inBandGreeter.get(), &InBandGreeter::stop, Qt::QueuedConnection);
     d->displayControl->close();
     d->clipboard->close();
+    d->audioStream->close();
     d->videoStream->close();
     setState(State::Closed);
     return true;

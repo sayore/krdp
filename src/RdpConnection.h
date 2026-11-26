@@ -20,6 +20,7 @@ namespace KRdp
 class InputHandler;
 class InBandGreeter;
 class Server;
+class AudioStream;
 class VideoStream;
 class VideoStreamSurface;
 class Cursor;
@@ -150,6 +151,8 @@ public:
 
     Clipboard *clipboard() const;
 
+    AudioStream *audioStream() const;
+
     DisplayControl *displayControl() const;
 
     NetworkDetection *networkDetection() const;
@@ -161,6 +164,7 @@ private:
     friend BOOL suppressOutput(rdpContext *, uint8_t, const RECTANGLE_16 *);
 
     friend class Cursor;
+    friend class AudioStream;
     friend class VideoStream;
     friend class VideoStreamSurface;
     friend class NetworkDetection;
