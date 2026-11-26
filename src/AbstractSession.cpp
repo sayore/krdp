@@ -5,12 +5,17 @@
 #include "AbstractSession.h"
 #include <unistd.h>
 
+#include <QBuffer>
 #include <QClipboard>
+#include <QImage>
 #include <QMimeData>
 
 #include <KSystemClipboard>
 
+#include "Clipboard.h"
 #include "krdp_logging.h"
+
+using namespace Qt::StringLiterals;
 
 namespace KRdp
 {
@@ -47,16 +52,55 @@ AbstractSession::AbstractSession()
             return;
         }
 
-        // text only, arbitrary MIME payloads can block on Wayland/XWayland targets (SAVE_TARGETS)
+        // Only inspect known safe targets (text and standard raster image MIME types);
+        // probing arbitrary MIME payloads can block on Wayland/XWayland targets (SAVE_TARGETS).
+        constexpr uint64_t MaxDecodedImageBytes = 64ull * 1024ull * 1024ull;
+        constexpr int MaxImageDimension = 16384;
+
+        const QStringList formats = data->formats();
         const QString text = data->hasText() ? data->text() : QString();
-        if (!data->hasText()) {
-            qCDebug(KRDP) << "Ignoring non-text clipboard update with formats" << data->formats();
+
+        QByteArray pngBytes;
+        QImage image;
+        if (formats.contains(u"image/png"_s)) {
+            const QByteArray raw = data->data(u"image/png"_s);
+            QImage decoded = Clipboard::decodeImageSafely(raw, "PNG");
+            if (!decoded.isNull()) {
+                pngBytes = raw;
+                image = std::move(decoded);
+            }
+        }
+        if (image.isNull() && formats.contains(u"image/bmp"_s)) {
+            image = Clipboard::decodeImageSafely(data->data(u"image/bmp"_s), "BMP");
+        }
+        if (image.isNull() && formats.contains(u"image/jpeg"_s)) {
+            image = Clipboard::decodeImageSafely(data->data(u"image/jpeg"_s), "JPEG");
+        }
+        if (image.isNull() && data->hasImage()) {
+            const QImage candidate = qvariant_cast<QImage>(data->imageData());
+            if (!candidate.isNull() && candidate.width() > 0 && candidate.height() > 0 && candidate.width() <= MaxImageDimension
+                && candidate.height() <= MaxImageDimension
+                && static_cast<uint64_t>(candidate.width()) * static_cast<uint64_t>(candidate.height()) * 4ull <= MaxDecodedImageBytes
+                && static_cast<uint64_t>(candidate.sizeInBytes()) <= MaxDecodedImageBytes) {
+                image = candidate;
+            }
+        }
+
+        if (text.isEmpty() && image.isNull() && !formats.isEmpty()) {
+            qCDebug(KRDP) << "Ignoring unsupported clipboard update with formats" << formats;
+            return;
         }
 
         // KSystemClipboard keeps ownership of what it returns, copy into a new QMimeData
         auto newData = new QMimeData();
         if (!text.isEmpty()) {
             newData->setText(text);
+        }
+        if (!image.isNull()) {
+            newData->setImageData(image);
+            if (!pngBytes.isEmpty()) {
+                newData->setData(u"image/png"_s, pngBytes);
+            }
         }
 
         Q_EMIT clipboardDataChanged(newData);
