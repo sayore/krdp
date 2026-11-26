@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <memory>
 
 #include <DmaBufHandler>
@@ -46,7 +47,8 @@ public:
     Surface surface;
     QSize size;
     QSize requestedSize;
-    bool pendingReset = true;
+    quint8 lastQuality = 100;
+    std::atomic<bool> pendingReset{true};
 
 private:
     VideoStream *const m_stream;

@@ -57,6 +57,7 @@ public:
     bool initialize();
     void close();
     Q_SIGNAL void closed();
+    Q_SIGNAL void capsConfirmed();
     Q_SIGNAL void sizeChanged(const QSize &size);
     Q_SIGNAL void cursorChanged(const PipeWireCursor &cursor);
 
@@ -106,10 +107,12 @@ private:
 
     void onPacketReceived(const PipeWireEncodedStream::Packet &data);
     void onFrameReceived(const PipeWireFrame &frame);
-    void setActiveEncodingMode(EncodingMode mode);
+    void setActiveEncodingMode(EncodingMode mode, bool forceSurfaceInit = false);
+    std::optional<EncodingMode> activeEncodingMode() const;
     void setSize(const QSize &size);
     bool streamingEnabled() const;
     void failVideoInitialization();
+    void resetLocalSurfaceState();
     void destroySurface();
     void performReset(QSize size);
     bool hasInFlightCapacity() const;

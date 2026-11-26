@@ -22,6 +22,7 @@ VideoStreamSurface::VideoStreamSurface(VideoStream *stream)
 
 void VideoStreamSurface::setActiveEncodingMode(VideoStream::EncodingMode mode, quint8 quality, int requestedFrameRate)
 {
+    lastQuality = quality;
     if (encodedStream) {
         encodedStream->stop();
         encodedStream.reset();
@@ -103,8 +104,8 @@ void VideoStreamSurface::setActiveEncodingMode(VideoStream::EncodingMode mode, q
                 return;
             }
             size = sourceStream->size();
+            sourceStream->setActive(m_stream->streamingEnabled());
         }
-        sourceStream->setActive(m_stream->streamingEnabled() && nodeId != 0);
     }
 }
 
@@ -126,13 +127,14 @@ void VideoStreamSurface::setStreamingEnabled(bool enabled)
             encodedStream->pause();
         }
     }
-    if (sourceStream) {
-        sourceStream->setActive(enabled && nodeId != 0);
+    if (sourceStream && nodeId != 0) {
+        sourceStream->setActive(enabled);
     }
 }
 
 void VideoStreamSurface::setVideoQuality(quint8 quality)
 {
+    lastQuality = quality;
     if (encodedStream) {
         encodedStream->setQuality(quality);
     }
@@ -140,9 +142,13 @@ void VideoStreamSurface::setVideoQuality(quint8 quality)
 
 void VideoStreamSurface::setRequestedSize(const QSize &newSize)
 {
+    if (newSize.isEmpty()) {
+        return;
+    }
     requestedSize = newSize;
     if (encodedStream) {
         encodedStream->setRequestedSize(newSize);
+        encodedStream->setQuality(lastQuality);
     }
     if (sourceStream) {
         sourceStream->setRequestedSize(newSize);
