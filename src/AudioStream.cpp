@@ -376,7 +376,7 @@ bool AudioStream::initialize(bool useDynamicChannel)
     ctx->server_formats = d->serverFormats.data();
     ctx->num_server_formats = d->serverFormats.size();
     ctx->src_format = &d->srcFormat;
-    ctx->latency = 20;
+    ctx->latency = 15;
     ctx->Activated = Private::activatedCallback;
     ctx->ConfirmBlock = Private::confirmBlockCallback;
     ctx->ChannelIdAssigned = Private::channelIdAssignedCallback;
@@ -575,10 +575,14 @@ bool AudioStream::Private::startPipeWireCaptureLocked(uint32_t sampleRate, uint1
                                              "Remote Audio (RDP)",
                                              PW_KEY_NODE_NICK,
                                              "Remote Audio",
+                                             PW_KEY_DEVICE_CLASS,
+                                             "sound",
+                                             PW_KEY_DEVICE_FORM_FACTOR,
+                                             "speaker",
                                              PW_KEY_DEVICE_ICON_NAME,
                                              "audio-card",
                                              PW_KEY_NODE_VIRTUAL,
-                                             "true",
+                                             "false",
                                              PW_KEY_PRIORITY_SESSION,
                                              "2000",
                                              PW_KEY_NODE_LATENCY,
@@ -706,8 +710,8 @@ void AudioStream::Private::runTxLoop(std::stop_token stopToken, size_t chunkFram
 {
     const auto startTime = std::chrono::steady_clock::now();
     constexpr int SilenceTailChunks = 40; // 400 ms tail at 10 ms/chunk
-    constexpr int MaxInFlightBlocks = 5; // ~50 ms in-flight latency cap
-    constexpr size_t MaxBufferedChunksBeforeTrim = 4; // trim stale backlog above ~40 ms
+    constexpr int MaxInFlightBlocks = 4; // ~40 ms in-flight latency cap
+    constexpr size_t MaxBufferedChunksBeforeTrim = 3; // trim stale backlog above ~30 ms
     int silentChunksRemaining = 0;
 
     std::vector<int16_t> chunk(chunkSamples);
@@ -731,9 +735,9 @@ void AudioStream::Private::runTxLoop(std::stop_token stopToken, size_t chunkFram
             continue;
         }
 
-        // Prevent permanent audio lag after transient spikes by trimming stale backlog down to ~20 ms.
+        // Prevent permanent audio lag after transient spikes (e.g. volume wheel chimes) by trimming stale backlog down to ~10 ms.
         if (avail > chunkSamples * MaxBufferedChunksBeforeTrim) {
-            const size_t targetKeep = chunkSamples * 2;
+            const size_t targetKeep = chunkSamples;
             ringBuffer.discard(avail - targetKeep);
         }
 
