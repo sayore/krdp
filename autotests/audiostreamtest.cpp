@@ -13,6 +13,7 @@
 #include <unistd.h>
 #include <vector>
 
+#include "AudioInputStream.h"
 #include "AudioStream.h"
 #include "RdpConnection.h"
 #include "Server.h"
@@ -217,10 +218,36 @@ private Q_SLOTS:
         QVERIFY(!conn.audioStream()->enabled());
         QVERIFY(!conn.audioStream()->activated());
 
+        QVERIFY(!conn.audioInputStream()->initialize());
+        QVERIFY(!conn.audioInputStream()->enabled());
+        QVERIFY(!conn.audioInputStream()->capturing());
+
         conn.close();
         ::close(fds[1]);
         QTRY_COMPARE_WITH_TIMEOUT(conn.state(), KRdp::RdpConnection::State::Closed, 2000);
         server.stop();
+    }
+
+    void testAudioInputFormatSelection()
+    {
+        // Prefers 48kHz mono 16-bit PCM > 48kHz stereo > 44.1kHz mono > 16kHz mono; ignores ADPCM/8-bit
+        const std::array<AUDIO_FORMAT, 5> formats = {
+            makeFmt(WAVE_FORMAT_ADPCM, 1, 48000, 4),
+            makeFmt(WAVE_FORMAT_PCM, 1, 16000, 16),
+            makeFmt(WAVE_FORMAT_PCM, 2, 48000, 16),
+            makeFmt(WAVE_FORMAT_PCM, 1, 48000, 16),
+            makeFmt(WAVE_FORMAT_PCM, 1, 44100, 8),
+        };
+        const auto best = KRdp::AudioInputStream::selectBestClientFormat(formats.data(), static_cast<uint32_t>(formats.size()));
+        QVERIFY(best.has_value());
+        QCOMPARE(*best, uint32_t(3));
+
+        const std::array<AUDIO_FORMAT, 1> mono16k = {makeFmt(WAVE_FORMAT_PCM, 1, 16000, 16)};
+        const auto fallback = KRdp::AudioInputStream::selectBestClientFormat(mono16k.data(), 1);
+        QVERIFY(fallback.has_value());
+        QCOMPARE(*fallback, uint32_t(0));
+
+        QVERIFY(!KRdp::AudioInputStream::selectBestClientFormat(nullptr, 0).has_value());
     }
 };
 

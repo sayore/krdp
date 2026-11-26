@@ -39,6 +39,7 @@
 #include <freerdp/channels/rdpsnd.h>
 
 #include "AbstractSession.h"
+#include "AudioInputStream.h"
 #include "AudioStream.h"
 #include "Clipboard.h"
 #include "Cursor.h"
@@ -293,6 +294,7 @@ public:
 
     std::unique_ptr<InputHandler> inputHandler;
     std::unique_ptr<InBandGreeter> inBandGreeter;
+    std::unique_ptr<AudioInputStream> audioInputStream;
     std::unique_ptr<AudioStream> audioStream;
     std::unique_ptr<VideoStream> videoStream;
     std::unique_ptr<Cursor> cursor;
@@ -354,6 +356,7 @@ RdpConnection::RdpConnection(Server *server, qintptr socketHandle, const Transpo
     d->networkDetection = std::make_unique<NetworkDetection>(this);
     d->clipboard = std::make_unique<Clipboard>(this);
     d->audioStream = std::make_unique<AudioStream>(this);
+    d->audioInputStream = std::make_unique<AudioInputStream>(this);
     d->displayControl = std::make_unique<DisplayControl>(this);
 
     connect(d->inputHandler.get(), &InputHandler::inputEvent, d->inBandGreeter.get(), [this](const std::shared_ptr<QInputEvent> &event) {
@@ -609,6 +612,11 @@ AudioStream *RdpConnection::audioStream() const
     return d->audioStream.get();
 }
 
+AudioInputStream *RdpConnection::audioInputStream() const
+{
+    return d->audioInputStream.get();
+}
+
 DisplayControl *RdpConnection::displayControl() const
 {
     return d->displayControl.get();
@@ -771,6 +779,7 @@ void RdpConnection::initialize()
     freerdp_settings_set_uint32(settings, FreeRDP_OsMinorType, OSMINORTYPE_PSEUDO_XSERVER);
 
     freerdp_settings_set_bool(settings, FreeRDP_AudioPlayback, true);
+    freerdp_settings_set_bool(settings, FreeRDP_AudioCapture, true);
 
     freerdp_settings_set_uint32(settings, FreeRDP_ColorDepth, 32);
 
@@ -838,6 +847,7 @@ void RdpConnection::run(std::stop_token stopToken)
     BYTE lastDrdynvcState = 0xFF;
     bool lastDrdynvcJoined = false;
     bool audioInitAttempted = false;
+    bool audioInputInitAttempted = false;
     setState(State::Running);
 
     while (!stopToken.stop_requested()) {
@@ -907,6 +917,14 @@ void RdpConnection::run(std::stop_token stopToken)
                 if (!audioOk) {
                     qCWarning(KRDP) << "RDPSND audio redirection could not be started (continuing without audio)";
                 }
+            }
+        }
+
+        if (!audioInputInitAttempted && d->peer->connected && (state() == State::Activated || state() == State::Streaming) && isAuthenticated() && drdynvcJoined
+            && drdynvcState == DRDYNVC_STATE_READY) {
+            audioInputInitAttempted = true;
+            if (!d->audioInputStream->initialize()) {
+                qCInfo(KRDP) << "AUDIN microphone redirection not active (continuing without microphone)";
             }
         }
 
@@ -1093,6 +1111,7 @@ bool RdpConnection::onClose()
     QMetaObject::invokeMethod(d->inBandGreeter.get(), &InBandGreeter::stop, Qt::QueuedConnection);
     d->displayControl->close();
     d->clipboard->close();
+    d->audioInputStream->close();
     d->audioStream->close();
     d->videoStream->close();
     {

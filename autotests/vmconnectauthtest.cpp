@@ -24,6 +24,7 @@
 
 #include <freerdp/codec/zgfx.h>
 
+#include "AudioInputStream.h"
 #include "AudioStream.h"
 #include "Clipboard.h"
 #include "InBandGreeter.h"
@@ -1135,6 +1136,7 @@ private Q_SLOTS:
         QCOMPARE(authSpy.count(), 0);
         QVERIFY(!conn.clipboard()->enabled());
         QVERIFY(!conn.audioStream()->enabled());
+        QVERIFY(!conn.audioInputStream()->enabled());
 
         // Start greeter directly (simulating RDPGFX open) and verify frame rendering + auth controls
         auto *greeter = conn.inBandGreeter();
